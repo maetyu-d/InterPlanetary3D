@@ -35,6 +35,8 @@ constexpr float kSprintMultiplier = 1.45f;
 constexpr float kJumpVelocity = 7.4f * kBlockSize;
 constexpr float kGravity = 20.0f * kBlockSize;
 constexpr float kMouseSensitivity = 0.08f;
+constexpr float kGamepadLookSpeed = 140.0f;
+constexpr float kGamepadDeadzone = 0.18f;
 constexpr float kPlayerRadius = 0.32f * kBlockSize;
 constexpr float kPlayerHeight = 1.75f * kBlockSize;
 constexpr float kEyeHeight = 1.62f * kBlockSize;
@@ -242,7 +244,36 @@ struct CameraFeedbackState {
   bool snapping = false;
 };
 
+struct SatelliteState {
+  float orbitYaw = 0.0f;
+  float orbitYawTarget = 0.0f;
+  float orbitPhase = 0.0f;
+  float orbitSpeed = 1.0f;
+  float orbitSpeedTarget = 1.0f;
+};
+
+struct PlayerState {
+  Player avatar;
+  bool invertedGravity = false;
+  std::optional<RaycastHit> hoveredBlock;
+  BlockType selectedBlock = Crust;
+  float health = kPlayerMaxHealth;
+  float damageFlash = 0.0f;
+  float carriedFuel = kFuelStartingCarry;
+  int carriedPlutonium = 0;
+  SatelliteState satellite;
+  HandState hand;
+  MiningState mining;
+  PlacementState placing;
+  CameraFeedbackState cameraFx;
+  bool jumpHeldLastFrame = false;
+  bool blockCycleLeftLastFrame = false;
+  bool blockCycleUpLastFrame = false;
+  bool blockCycleRightLastFrame = false;
+};
+
 struct AtomicBombState {
+  int ownerIndex = 0;
   bool active = false;
   bool bouncing = false;
   bool exploding = false;
@@ -261,42 +292,29 @@ struct AtomicBombState {
 };
 
 struct AppState {
-  Player player;
-  glm::vec3 spawnPosition{0.0f};
+  std::array<PlayerState, 2> players;
+  std::array<glm::vec3, 2> spawnPositions{};
+  std::array<int, 2> scores{0, 0};
   InputState input;
   World world;
   std::array<ChunkMesh, kChunkCount> chunkMeshes;
-  std::optional<RaycastHit> hoveredBlock;
-  BlockType selectedBlock = Crust;
-  float playerHealth = kPlayerMaxHealth;
-  float playerDamageFlash = 0.0f;
-  float carriedFuel = kFuelStartingCarry;
-  int carriedPlutonium = 0;
-  float satelliteOrbitYaw = 0.0f;
-  float satelliteOrbitYawTarget = 0.0f;
-  float satelliteOrbitPhase = 0.0f;
-  float satelliteOrbitSpeed = 1.0f;
-  float satelliteOrbitSpeedTarget = 1.0f;
   bool launcherEquipped = false;
   MissileAimState missileAim;
   MissileState missile;
-  HandState hand;
-  MiningState mining;
-  PlacementState placing;
-  CameraFeedbackState cameraFx;
   AtomicBombState atomicBomb;
 };
 
 AppState* gState = nullptr;
+GLFWcursor* gHiddenCursor = nullptr;
 
-void triggerHandSwing(AppState& state);
-void triggerCameraThump(AppState& state);
-void triggerCameraSnap(AppState& state);
-void resetMining(AppState& state);
-void resetPlacement(AppState& state);
-void respawnPlayer(AppState& state);
-void applyPlayerDamage(AppState& state, float amount);
-void dropAtomicBomb(AppState& state);
+void triggerHandSwing(PlayerState& playerState);
+void triggerCameraThump(PlayerState& playerState);
+void triggerCameraSnap(PlayerState& playerState);
+void resetMining(PlayerState& playerState);
+void resetPlacement(PlayerState& playerState);
+void respawnPlayer(AppState& state, int playerIndex, std::optional<int> killerIndex = std::nullopt);
+void applyPlayerDamage(AppState& state, int playerIndex, float amount, std::optional<int> attackerIndex = std::nullopt);
+void dropAtomicBomb(AppState& state, int ownerIndex);
 void updateAtomicBomb(AppState& state, float deltaTime);
 
 int chunkIndexForCoords(int chunkX, int chunkZ) {
@@ -319,6 +337,40 @@ float hashNoise3(int x, int y, int z) {
 
 glm::vec3 eyePosition(const Player& player) {
   return player.position + glm::vec3(0.0f, kEyeHeight, 0.0f);
+}
+
+float gravityDirection(const PlayerState& playerState) {
+  return playerState.invertedGravity ? 1.0f : -1.0f;
+}
+
+glm::vec3 eyePosition(const PlayerState& playerState) {
+  return playerState.avatar.position + glm::vec3(0.0f, playerState.invertedGravity ? -kEyeHeight : kEyeHeight, 0.0f);
+}
+
+glm::vec3 playerBoundsMin(const PlayerState& playerState, const glm::vec3& position) {
+  if (playerState.invertedGravity) {
+    return glm::vec3(position.x - kPlayerRadius + kCollisionInset,
+                     position.y - kPlayerHeight + kCollisionInset,
+                     position.z - kPlayerRadius + kCollisionInset);
+  }
+  return glm::vec3(position.x - kPlayerRadius + kCollisionInset,
+                   position.y + kCollisionInset,
+                   position.z - kPlayerRadius + kCollisionInset);
+}
+
+glm::vec3 playerBoundsMax(const PlayerState& playerState, const glm::vec3& position) {
+  if (playerState.invertedGravity) {
+    return glm::vec3(position.x + kPlayerRadius - kCollisionInset,
+                     position.y - kCollisionInset,
+                     position.z + kPlayerRadius - kCollisionInset);
+  }
+  return glm::vec3(position.x + kPlayerRadius - kCollisionInset,
+                   position.y + kPlayerHeight - kCollisionInset,
+                   position.z + kPlayerRadius - kCollisionInset);
+}
+
+glm::vec3 viewUpVector(const PlayerState& playerState) {
+  return glm::vec3(0.0f, playerState.invertedGravity ? -1.0f : 1.0f, 0.0f);
 }
 
 int worldToBlockCoord(float value) {
@@ -471,9 +523,10 @@ float placementDurationFor(BlockType type) {
 
 MissileSolution buildMissileSolution(const AppState& state, std::optional<float> powerOverride = std::nullopt) {
   MissileSolution solution;
+  const Player& player = state.players[0].avatar;
   const glm::vec3 center = worldCenter();
-  const glm::vec3 outward = glm::normalize(state.player.position - center);
-  const glm::vec3 front = cameraFront(state.player);
+  const glm::vec3 outward = glm::normalize(player.position - center);
+  const glm::vec3 front = cameraFront(player);
   const float power = std::clamp(powerOverride.value_or(state.missileAim.power), kMissileMinPower, kMissileMaxPower);
 
   glm::vec3 surfaceForward = front - outward * glm::dot(front, outward);
@@ -486,7 +539,7 @@ MissileSolution buildMissileSolution(const AppState& state, std::optional<float>
     }
   }
 
-  const float pitchBias = std::clamp(state.player.pitch / 75.0f, -1.0f, 1.0f);
+  const float pitchBias = std::clamp(player.pitch / 75.0f, -1.0f, 1.0f);
   glm::vec3 aimOffset(surfaceForward.x, 0.0f, surfaceForward.z);
   if (glm::dot(aimOffset, aimOffset) > 0.0001f) {
     const float pitchRangeScale = std::clamp(1.0f + pitchBias * kMissilePitchRangeInfluence, 0.15f, 1.85f);
@@ -500,14 +553,14 @@ MissileSolution buildMissileSolution(const AppState& state, std::optional<float>
   const glm::vec3 launchDir = glm::normalize(surfaceForward * tangentWeight + outward * radialWeight);
 
   solution.launchPos =
-      eyePosition(state.player) + outward * (kMissileLaunchLift + power * 0.5f * kBlockSize) +
+      eyePosition(player) + outward * (kMissileLaunchLift + power * 0.5f * kBlockSize) +
       launchDir * ((0.75f + power * 0.5f) * kBlockSize);
 
   solution.impactPos = glm::vec3(
-      std::clamp(state.player.position.x + aimOffset.x, 0.5f * kBlockSize,
+      std::clamp(player.position.x + aimOffset.x, 0.5f * kBlockSize,
                  static_cast<float>(kWorldX) * kBlockSize - 0.5f * kBlockSize),
       0.5f * kBlockSize,
-      std::clamp(state.player.position.z + aimOffset.z, 0.5f * kBlockSize,
+      std::clamp(player.position.z + aimOffset.z, 0.5f * kBlockSize,
                  static_cast<float>(kWorldZ) * kBlockSize - 0.5f * kBlockSize));
 
   const glm::vec3 startDir = launchDir;
@@ -1248,8 +1301,10 @@ void startAtomicBombExplosion(AppState& state, const glm::vec3& impactPos, bool 
   state.atomicBomb.position = impactPos;
   state.atomicBomb.explosionAge = 0.0f;
   pushAtomicBombTrail(state.atomicBomb, impactPos);
-  triggerCameraThump(state);
-  triggerCameraSnap(state);
+  for (PlayerState& playerState : state.players) {
+    triggerCameraThump(playerState);
+    triggerCameraSnap(playerState);
+  }
   if (!hitForcefield) {
     clearExplosionCrater(state, impactPos, kAtomicBombCraterRadius * state.atomicBomb.blastScale);
   }
@@ -1280,18 +1335,18 @@ void startAtomicBombBounce(AppState& state, const glm::vec3& impactPos, bool hit
   }
   state.atomicBomb.bounceDrift = lateral;
   pushAtomicBombTrail(state.atomicBomb, impactPos);
-  triggerCameraThump(state);
+  for (PlayerState& playerState : state.players) {
+    triggerCameraThump(playerState);
+  }
 }
 
 bool isSolid(const World& world, int x, int y, int z) {
   return world.get(x, y, z) != Air;
 }
 
-bool collidesAt(const World& world, const glm::vec3& position) {
-  const glm::vec3 min(position.x - kPlayerRadius + kCollisionInset, position.y + kCollisionInset,
-                      position.z - kPlayerRadius + kCollisionInset);
-  const glm::vec3 max(position.x + kPlayerRadius - kCollisionInset, position.y + kPlayerHeight - kCollisionInset,
-                      position.z + kPlayerRadius - kCollisionInset);
+bool collidesAt(const World& world, const PlayerState& playerState, const glm::vec3& position) {
+  const glm::vec3 min = playerBoundsMin(playerState, position);
+  const glm::vec3 max = playerBoundsMax(playerState, position);
 
   const int minX = worldToBlockCoord(min.x);
   const int maxX = worldToBlockCoord(max.x);
@@ -1313,6 +1368,42 @@ bool collidesAt(const World& world, const glm::vec3& position) {
   return false;
 }
 
+int bottomSolidYAt(const World& world, int x, int z) {
+  for (int y = 0; y < kWorldY; ++y) {
+    if (world.get(x, y, z) != Air) {
+      return y;
+    }
+  }
+  return 0;
+}
+
+glm::vec3 findInvertedSpawnPosition(const World& world) {
+  const int centerX = kWorldX / 2;
+  const int centerZ = kWorldZ / 2;
+  int bestX = centerX;
+  int bestZ = centerZ;
+  int bestY = bottomSolidYAt(world, centerX, centerZ);
+
+  for (int radius = 0; radius < 8; ++radius) {
+    for (int dz = -radius; dz <= radius; ++dz) {
+      for (int dx = -radius; dx <= radius; ++dx) {
+        const int x = std::clamp(centerX + dx, 0, kWorldX - 1);
+        const int z = std::clamp(centerZ + dz, 0, kWorldZ - 1);
+        const int y = bottomSolidYAt(world, x, z);
+        if (y < bestY) {
+          bestY = y;
+          bestX = x;
+          bestZ = z;
+        }
+      }
+    }
+  }
+
+  return glm::vec3((static_cast<float>(bestX) + 0.5f) * kBlockSize,
+                   static_cast<float>(bestY) * kBlockSize,
+                   (static_cast<float>(bestZ) + 0.5f) * kBlockSize);
+}
+
 std::optional<RaycastHit> raycast(const World& world, const glm::vec3& origin, const glm::vec3& direction, float maxDistance) {
   glm::vec3 pos = origin;
   glm::ivec3 previous = worldToBlock(origin);
@@ -1330,11 +1421,9 @@ std::optional<RaycastHit> raycast(const World& world, const glm::vec3& origin, c
   return std::nullopt;
 }
 
-bool playerIntersectsBlock(const glm::vec3& position, const glm::ivec3& block) {
-  const glm::vec3 minA(position.x - kPlayerRadius + kCollisionInset, position.y + kCollisionInset,
-                       position.z - kPlayerRadius + kCollisionInset);
-  const glm::vec3 maxA(position.x + kPlayerRadius - kCollisionInset, position.y + kPlayerHeight - kCollisionInset,
-                       position.z + kPlayerRadius - kCollisionInset);
+bool playerIntersectsBlock(const PlayerState& playerState, const glm::vec3& position, const glm::ivec3& block) {
+  const glm::vec3 minA = playerBoundsMin(playerState, position);
+  const glm::vec3 maxA = playerBoundsMax(playerState, position);
 
   const glm::vec3 minB = blockToWorld(block);
   const glm::vec3 maxB = minB + glm::vec3(kBlockSize);
@@ -1344,23 +1433,24 @@ bool playerIntersectsBlock(const glm::vec3& position, const glm::ivec3& block) {
          minA.z < maxB.z && maxA.z > minB.z;
 }
 
-bool playerTouchesForcefield(const glm::vec3& position) {
-  const float playerMinY = position.y + kCollisionInset;
-  const float playerMaxY = position.y + kPlayerHeight - kCollisionInset;
+bool playerTouchesForcefield(const PlayerState& playerState, const glm::vec3& position) {
+  const glm::vec3 minBounds = playerBoundsMin(playerState, position);
+  const glm::vec3 maxBounds = playerBoundsMax(playerState, position);
+  const float playerMinY = minBounds.y;
+  const float playerMaxY = maxBounds.y;
   const float fieldCenterY = worldCenter().y;
   const float fieldMinY = fieldCenterY - kForcefieldThickness * 0.5f;
   const float fieldMaxY = fieldCenterY + kForcefieldThickness * 0.5f;
   return playerMaxY > fieldMinY && playerMinY < fieldMaxY;
 }
 
-std::optional<BombsitePrediction> predictBombsiteImpact(const World& world, float orbitPhase, float orbitYaw,
-                                                        float orbitSpeedScale) {
+std::optional<BombsitePrediction> predictBombsiteImpact(const World& world, const SatelliteState& satellite) {
   const glm::vec3 center = worldCenter();
-  glm::vec3 position = satellitePositionAtAngle(orbitPhase, orbitYaw, orbitSpeedScale);
+  glm::vec3 position = satellitePositionAtAngle(satellite.orbitPhase, satellite.orbitYaw, satellite.orbitSpeed);
   const glm::vec3 radial = position - center;
-  const float orbitRadius = satelliteOrbitRadius(orbitSpeedScale);
-  const float orbitSpeed = glm::two_pi<float>() * orbitRadius * orbitSpeedScale / kSatelliteOrbitPeriod;
-  glm::vec3 velocity = satelliteTangentAtAngle(orbitPhase, orbitYaw, orbitSpeedScale) * orbitSpeed;
+  const float orbitRadius = satelliteOrbitRadius(satellite.orbitSpeed);
+  const float orbitSpeed = glm::two_pi<float>() * orbitRadius * satellite.orbitSpeed / kSatelliteOrbitPeriod;
+  glm::vec3 velocity = satelliteTangentAtAngle(satellite.orbitPhase, satellite.orbitYaw, satellite.orbitSpeed) * orbitSpeed;
 
   const float fieldCenterY = center.y;
   const float fieldHalfWidth = static_cast<float>(kWorldX) * kBlockSize * kForcefieldOversize * 0.5f;
@@ -1395,47 +1485,52 @@ std::optional<BombsitePrediction> predictBombsiteImpact(const World& world, floa
   return std::nullopt;
 }
 
-void tryBreakBlock(AppState& state) {
-  if (!state.hoveredBlock.has_value()) {
+void tryBreakBlock(AppState& state, PlayerState& playerState) {
+  if (!playerState.hoveredBlock.has_value()) {
     return;
   }
 
-  const glm::ivec3 block = state.hoveredBlock->block;
+  const glm::ivec3 block = playerState.hoveredBlock->block;
   if (block.y <= 0) {
     return;
   }
 
-  if (state.hoveredBlock->type == Fuel) {
-    state.carriedFuel = std::min(kFuelCarryMax, state.carriedFuel + kFuelPickupAmount);
-  } else if (state.hoveredBlock->type == Plutonium) {
-    state.carriedPlutonium += kPlutoniumPerPickup;
+  if (playerState.hoveredBlock->type == Fuel) {
+    playerState.carriedFuel = std::min(kFuelCarryMax, playerState.carriedFuel + kFuelPickupAmount);
+  } else if (playerState.hoveredBlock->type == Plutonium) {
+    playerState.carriedPlutonium += kPlutoniumPerPickup;
   }
 
   state.world.set(block.x, block.y, block.z, Air);
   markDirtyAroundBlock(state, block.x, block.z);
-  triggerHandSwing(state);
-  triggerCameraSnap(state);
-  resetMining(state);
+  triggerHandSwing(playerState);
+  triggerCameraSnap(playerState);
+  resetMining(playerState);
 }
 
-void tryPlaceBlock(AppState& state) {
-  if (!state.hoveredBlock.has_value()) {
+void tryPlaceBlock(AppState& state, PlayerState& playerState) {
+  if (!playerState.hoveredBlock.has_value()) {
     return;
   }
 
-  const glm::ivec3 place = state.hoveredBlock->previous;
+  const glm::ivec3 place = playerState.hoveredBlock->previous;
   if (!state.world.inBounds(place.x, place.y, place.z) || state.world.get(place.x, place.y, place.z) != Air) {
     return;
   }
-  if (playerIntersectsBlock(state.player.position, place)) {
+  for (const PlayerState& otherPlayer : state.players) {
+    if (playerIntersectsBlock(otherPlayer, otherPlayer.avatar.position, place)) {
+      return;
+    }
+  }
+  if (playerIntersectsBlock(playerState, playerState.avatar.position, place)) {
     return;
   }
 
-  state.world.set(place.x, place.y, place.z, state.selectedBlock);
+  state.world.set(place.x, place.y, place.z, playerState.selectedBlock);
   markDirtyAroundBlock(state, place.x, place.z);
-  triggerHandSwing(state);
-  triggerCameraSnap(state);
-  resetPlacement(state);
+  triggerHandSwing(playerState);
+  triggerCameraSnap(playerState);
+  resetPlacement(playerState);
 }
 
 bool missileHitsTarget(const glm::vec3& impactPos) {
@@ -1467,7 +1562,7 @@ void launchMissile(AppState& state) {
   state.missile.duration = solution.duration;
   state.missile.explosionAge = 0.0f;
   state.missileAim.charging = false;
-  triggerHandSwing(state);
+  triggerHandSwing(state.players[0]);
 }
 
 void updateMissile(AppState& state, float deltaTime) {
@@ -1496,33 +1591,35 @@ void updateMissile(AppState& state, float deltaTime) {
   }
 }
 
-void dropAtomicBomb(AppState& state) {
+void dropAtomicBomb(AppState& state, int ownerIndex) {
   if (state.atomicBomb.active || state.atomicBomb.exploding) {
     return;
   }
 
-  const float orbitRadius = satelliteOrbitRadius(state.satelliteOrbitSpeed);
-  const bool fullStrength = state.carriedPlutonium >= kPlutoniumPerAtomicBomb;
+  PlayerState& owner = state.players[static_cast<std::size_t>(ownerIndex)];
+  const SatelliteState& satellite = owner.satellite;
+  const float orbitRadius = satelliteOrbitRadius(satellite.orbitSpeed);
+  const bool fullStrength = owner.carriedPlutonium >= kPlutoniumPerAtomicBomb;
   if (fullStrength) {
-    state.carriedPlutonium -= kPlutoniumPerAtomicBomb;
+    owner.carriedPlutonium -= kPlutoniumPerAtomicBomb;
   }
+  state.atomicBomb.ownerIndex = ownerIndex;
   state.atomicBomb.active = true;
   state.atomicBomb.bouncing = false;
   state.atomicBomb.exploding = false;
   state.atomicBomb.hitForcefield = false;
   state.atomicBomb.damageApplied = false;
   state.atomicBomb.blastScale = fullStrength ? 1.0f : 0.5f;
-  state.atomicBomb.position =
-      satellitePositionAtAngle(state.satelliteOrbitPhase, state.satelliteOrbitYaw, state.satelliteOrbitSpeed);
+  state.atomicBomb.position = satellitePositionAtAngle(satellite.orbitPhase, satellite.orbitYaw, satellite.orbitSpeed);
   state.atomicBomb.velocity =
-      satelliteTangentAtAngle(state.satelliteOrbitPhase, state.satelliteOrbitYaw, state.satelliteOrbitSpeed) *
-      (glm::two_pi<float>() * orbitRadius * state.satelliteOrbitSpeed / kSatelliteOrbitPeriod);
+      satelliteTangentAtAngle(satellite.orbitPhase, satellite.orbitYaw, satellite.orbitSpeed) *
+      (glm::two_pi<float>() * orbitRadius * satellite.orbitSpeed / kSatelliteOrbitPeriod);
   state.atomicBomb.impactPos = state.atomicBomb.position;
   state.atomicBomb.bounceAge = 0.0f;
   state.atomicBomb.explosionAge = 0.0f;
   state.atomicBomb.trailCount = 0;
   pushAtomicBombTrail(state.atomicBomb, state.atomicBomb.position);
-  triggerHandSwing(state);
+  triggerHandSwing(owner);
 }
 
 void updateAtomicBomb(AppState& state, float deltaTime) {
@@ -1584,11 +1681,17 @@ void updateAtomicBomb(AppState& state, float deltaTime) {
   } else if (state.atomicBomb.exploding) {
     if (!state.atomicBomb.damageApplied) {
       const float blastRadius = kAtomicBombBlastRadius * state.atomicBomb.blastScale;
-      const glm::vec3 playerCenter = state.player.position + glm::vec3(0.0f, kPlayerHeight * 0.5f, 0.0f);
-      const float distance = glm::distance(playerCenter, state.atomicBomb.impactPos);
-      if (distance < blastRadius) {
-        const float falloff = 1.0f - std::clamp(distance / blastRadius, 0.0f, 1.0f);
-        applyPlayerDamage(state, kPlayerAtomicBombBaseDamage * state.atomicBomb.blastScale * falloff);
+      for (int playerIndex = 0; playerIndex < static_cast<int>(state.players.size()); ++playerIndex) {
+        const glm::vec3 playerCenter =
+            state.players[static_cast<std::size_t>(playerIndex)].avatar.position +
+            glm::vec3(0.0f, kPlayerHeight * 0.5f, 0.0f);
+        const float distance = glm::distance(playerCenter, state.atomicBomb.impactPos);
+        if (distance < blastRadius) {
+          const float falloff = 1.0f - std::clamp(distance / blastRadius, 0.0f, 1.0f);
+          applyPlayerDamage(state, playerIndex,
+                            kPlayerAtomicBombBaseDamage * state.atomicBomb.blastScale * falloff,
+                            state.atomicBomb.ownerIndex);
+        }
       }
       state.atomicBomb.damageApplied = true;
     }
@@ -1603,63 +1706,72 @@ void updateAtomicBomb(AppState& state, float deltaTime) {
 }
 
 void updateSatelliteFuel(AppState& state, float deltaTime) {
-  state.carriedFuel = std::max(0.0f, state.carriedFuel - kFuelDrainPerSecond * deltaTime);
+  for (PlayerState& playerState : state.players) {
+    playerState.carriedFuel = std::max(0.0f, playerState.carriedFuel - kFuelDrainPerSecond * deltaTime);
+  }
 }
 
-void respawnPlayer(AppState& state) {
-  state.player.position = state.spawnPosition;
-  state.player.velocity = glm::vec3(0.0f);
-  state.player.onGround = false;
-  state.playerHealth = kPlayerMaxHealth;
-  state.playerDamageFlash = 1.0f;
-  resetMining(state);
-  resetPlacement(state);
-  triggerCameraSnap(state);
+void respawnPlayer(AppState& state, int playerIndex, std::optional<int> killerIndex) {
+  if (killerIndex.has_value() && killerIndex.value() != playerIndex &&
+      killerIndex.value() >= 0 && killerIndex.value() < static_cast<int>(state.scores.size())) {
+    state.scores[static_cast<std::size_t>(killerIndex.value())] += 1;
+  }
+
+  PlayerState& playerState = state.players[static_cast<std::size_t>(playerIndex)];
+  playerState.avatar.position = state.spawnPositions[static_cast<std::size_t>(playerIndex)];
+  playerState.avatar.velocity = glm::vec3(0.0f);
+  playerState.avatar.onGround = false;
+  playerState.health = kPlayerMaxHealth;
+  playerState.damageFlash = 1.0f;
+  resetMining(playerState);
+  resetPlacement(playerState);
+  triggerCameraSnap(playerState);
 }
 
-void applyPlayerDamage(AppState& state, float amount) {
+void applyPlayerDamage(AppState& state, int playerIndex, float amount, std::optional<int> attackerIndex) {
   if (amount <= 0.0f) {
     return;
   }
 
-  state.playerHealth = std::max(0.0f, state.playerHealth - amount);
-  state.playerDamageFlash = 1.0f;
-  triggerCameraThump(state);
-  if (state.playerHealth <= 0.0f) {
-    respawnPlayer(state);
+  PlayerState& playerState = state.players[static_cast<std::size_t>(playerIndex)];
+  playerState.health = std::max(0.0f, playerState.health - amount);
+  playerState.damageFlash = 1.0f;
+  triggerCameraThump(playerState);
+  if (playerState.health <= 0.0f) {
+    respawnPlayer(state, playerIndex, attackerIndex);
   }
 }
 
-void updateHand(AppState& state, float deltaTime) {
-  if (!state.hand.swinging) {
+void updateHand(PlayerState& playerState, float deltaTime) {
+  if (!playerState.hand.swinging) {
     return;
   }
 
-  state.hand.swingTime += deltaTime;
-  if (state.hand.swingTime >= kHandSwingDuration) {
-    state.hand.swingTime = 0.0f;
-    state.hand.swinging = false;
+  playerState.hand.swingTime += deltaTime;
+  if (playerState.hand.swingTime >= kHandSwingDuration) {
+    playerState.hand.swingTime = 0.0f;
+    playerState.hand.swinging = false;
   }
 }
 
-void updateCameraFeedback(AppState& state, float deltaTime) {
-  if (state.cameraFx.thumping) {
-    state.cameraFx.thumpTime += deltaTime;
-    if (state.cameraFx.thumpTime >= kCameraThumpDuration) {
-      state.cameraFx.thumpTime = 0.0f;
-      state.cameraFx.thumping = false;
+void updateCameraFeedback(PlayerState& playerState, float deltaTime) {
+  if (playerState.cameraFx.thumping) {
+    playerState.cameraFx.thumpTime += deltaTime;
+    if (playerState.cameraFx.thumpTime >= kCameraThumpDuration) {
+      playerState.cameraFx.thumpTime = 0.0f;
+      playerState.cameraFx.thumping = false;
     }
   }
 
-  if (state.cameraFx.snapping) {
-    state.cameraFx.snapTime += deltaTime;
-    if (state.cameraFx.snapTime >= kCameraSnapDuration) {
-      state.cameraFx.snapTime = 0.0f;
-      state.cameraFx.snapping = false;
+  if (playerState.cameraFx.snapping) {
+    playerState.cameraFx.snapTime += deltaTime;
+    if (playerState.cameraFx.snapTime >= kCameraSnapDuration) {
+      playerState.cameraFx.snapTime = 0.0f;
+      playerState.cameraFx.snapping = false;
     }
   }
 
-  state.playerDamageFlash = std::max(0.0f, state.playerDamageFlash - deltaTime * kPlayerDamageFlashDecay);
+  playerState.damageFlash = std::max(0.0f, playerState.damageFlash - deltaTime * kPlayerDamageFlashDecay);
 }
 
 void framebufferSizeCallback(GLFWwindow*, int width, int height) {
@@ -1682,29 +1794,89 @@ void mouseCallback(GLFWwindow*, double xpos, double ypos) {
   gState->input.lastMouseX = xpos;
   gState->input.lastMouseY = ypos;
 
-  gState->player.yaw += static_cast<float>(xoffset) * kMouseSensitivity;
-  gState->player.pitch += static_cast<float>(yoffset) * kMouseSensitivity;
-  gState->player.pitch = std::clamp(gState->player.pitch, -89.0f, 89.0f);
+  gState->players[0].avatar.yaw += static_cast<float>(xoffset) * kMouseSensitivity;
+  gState->players[0].avatar.pitch += static_cast<float>(yoffset) * kMouseSensitivity;
+  gState->players[0].avatar.pitch = std::clamp(gState->players[0].avatar.pitch, -89.0f, 89.0f);
 }
 
 void toggleMouseCapture(GLFWwindow* window, InputState& input, bool captured) {
   input.captureMouse = captured;
   input.firstMouse = true;
+  glfwSetCursor(window, captured ? gHiddenCursor : nullptr);
   glfwSetInputMode(window, GLFW_CURSOR, captured ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
 }
 
-void moveAxis(const World& world, glm::vec3& position, float delta, int axis, bool& blocked) {
+void moveAxis(const World& world, const PlayerState& playerState, glm::vec3& position, float delta, int axis, bool& blocked) {
   if (delta == 0.0f) {
     return;
   }
 
   glm::vec3 candidate = position;
   candidate[axis] += delta;
-  if (!collidesAt(world, candidate)) {
+  if (!collidesAt(world, playerState, candidate)) {
     position = candidate;
   } else {
     blocked = true;
   }
+}
+
+float applyDeadzone(float value) {
+  if (std::abs(value) < kGamepadDeadzone) {
+    return 0.0f;
+  }
+  const float sign = value < 0.0f ? -1.0f : 1.0f;
+  return sign * ((std::abs(value) - kGamepadDeadzone) / (1.0f - kGamepadDeadzone));
+}
+
+void integratePlayerMovement(PlayerState& playerState, const World& world, const glm::vec3& wishDir,
+                             bool sprinting, bool jumpPressed, float deltaTime) {
+  Player& player = playerState.avatar;
+  const float moveSpeed = kWalkSpeed * (sprinting ? kSprintMultiplier : 1.0f);
+  player.velocity.x = wishDir.x * moveSpeed;
+  player.velocity.z = wishDir.z * moveSpeed;
+
+  if (jumpPressed && !playerState.jumpHeldLastFrame && player.onGround) {
+    player.velocity.y = -gravityDirection(playerState) * kJumpVelocity;
+    player.onGround = false;
+  }
+  playerState.jumpHeldLastFrame = jumpPressed;
+
+  player.velocity.y += gravityDirection(playerState) * kGravity * deltaTime;
+  if (!playerState.invertedGravity && player.velocity.y < -30.0f) {
+    player.velocity.y = -30.0f;
+  } else if (playerState.invertedGravity && player.velocity.y > 30.0f) {
+    player.velocity.y = 30.0f;
+  }
+
+  glm::vec3 candidate = player.position;
+  bool blockedX = false;
+  bool blockedY = false;
+  bool blockedZ = false;
+
+  moveAxis(world, playerState, candidate, player.velocity.x * deltaTime, 0, blockedX);
+  moveAxis(world, playerState, candidate, player.velocity.y * deltaTime, 1, blockedY);
+  moveAxis(world, playerState, candidate, player.velocity.z * deltaTime, 2, blockedZ);
+
+  player.position = candidate;
+
+  if (blockedX) player.velocity.x = 0.0f;
+  if (blockedZ) player.velocity.z = 0.0f;
+  if (blockedY) {
+    if ((!playerState.invertedGravity && player.velocity.y < 0.0f) ||
+        (playerState.invertedGravity && player.velocity.y > 0.0f)) {
+      player.onGround = true;
+    }
+    player.velocity.y = 0.0f;
+  } else {
+    player.onGround = false;
+  }
+
+  const float minX = kPlayerRadius;
+  const float maxX = static_cast<float>(kWorldX) * kBlockSize - kPlayerRadius;
+  const float minZ = kPlayerRadius;
+  const float maxZ = static_cast<float>(kWorldZ) * kBlockSize - kPlayerRadius;
+  player.position.x = std::clamp(player.position.x, minX, maxX);
+  player.position.z = std::clamp(player.position.z, minZ, maxZ);
 }
 
 void updateMovement(GLFWwindow* window, AppState& state, float deltaTime) {
@@ -1715,213 +1887,284 @@ void updateMovement(GLFWwindow* window, AppState& state, float deltaTime) {
     toggleMouseCapture(window, state.input, true);
   }
 
-  const glm::vec3 front = cameraFront(state.player);
-  glm::vec3 flatFront(front.x, 0.0f, front.z);
-  if (glm::length(flatFront) < 0.0001f) {
-    flatFront = glm::vec3(0.0f, 0.0f, -1.0f);
-  } else {
-    flatFront = glm::normalize(flatFront);
-  }
-  const glm::vec3 right = glm::normalize(glm::cross(flatFront, glm::vec3(0.0f, 1.0f, 0.0f)));
-
-  glm::vec3 wishDir(0.0f);
-  if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) wishDir += flatFront;
-  if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) wishDir -= flatFront;
-  if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) wishDir -= right;
-  if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) wishDir += right;
-
-  if (glm::length(wishDir) > 0.0f) {
-    wishDir = glm::normalize(wishDir);
-  }
-
-  const bool sprinting = glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS;
-  const float moveSpeed = kWalkSpeed * (sprinting ? kSprintMultiplier : 1.0f);
-  state.player.velocity.x = wishDir.x * moveSpeed;
-  state.player.velocity.z = wishDir.z * moveSpeed;
-
-  const bool jumpPressed = glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS;
-  if (jumpPressed && !state.input.jumpHeldLastFrame && state.player.onGround) {
-    state.player.velocity.y = kJumpVelocity;
-    state.player.onGround = false;
-  }
-  state.input.jumpHeldLastFrame = jumpPressed;
-
-  state.player.velocity.y -= kGravity * deltaTime;
-  if (state.player.velocity.y < -30.0f) {
-    state.player.velocity.y = -30.0f;
-  }
-
-  glm::vec3 candidate = state.player.position;
-  bool blockedX = false;
-  bool blockedY = false;
-  bool blockedZ = false;
-
-  moveAxis(state.world, candidate, state.player.velocity.x * deltaTime, 0, blockedX);
-  moveAxis(state.world, candidate, state.player.velocity.y * deltaTime, 1, blockedY);
-  moveAxis(state.world, candidate, state.player.velocity.z * deltaTime, 2, blockedZ);
-
-  state.player.position = candidate;
-
-  if (blockedX) state.player.velocity.x = 0.0f;
-  if (blockedZ) state.player.velocity.z = 0.0f;
-  if (blockedY) {
-    if (state.player.velocity.y < 0.0f) {
-      state.player.onGround = true;
+  PlayerState& playerOne = state.players[0];
+  {
+    const glm::vec3 front = cameraFront(playerOne.avatar);
+    glm::vec3 flatFront(front.x, 0.0f, front.z);
+    if (glm::length(flatFront) < 0.0001f) {
+      flatFront = glm::vec3(0.0f, 0.0f, -1.0f);
+    } else {
+      flatFront = glm::normalize(flatFront);
     }
-    state.player.velocity.y = 0.0f;
-  } else {
-    state.player.onGround = false;
+    const glm::vec3 right = glm::normalize(glm::cross(flatFront, glm::vec3(0.0f, 1.0f, 0.0f)));
+
+    glm::vec3 wishDir(0.0f);
+    if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) wishDir += flatFront;
+    if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) wishDir -= flatFront;
+    if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) wishDir -= right;
+    if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) wishDir += right;
+
+    if (glm::length(wishDir) > 0.0f) {
+      wishDir = glm::normalize(wishDir);
+    }
+
+    const bool sprinting = glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS;
+    const bool jumpPressed = glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS;
+    integratePlayerMovement(playerOne, state.world, wishDir, sprinting, jumpPressed, deltaTime);
   }
 
-  const float minX = kPlayerRadius;
-  const float maxX = static_cast<float>(kWorldX) * kBlockSize - kPlayerRadius;
-  const float minZ = kPlayerRadius;
-  const float maxZ = static_cast<float>(kWorldZ) * kBlockSize - kPlayerRadius;
-  state.player.position.x = std::clamp(state.player.position.x, minX, maxX);
-  state.player.position.z = std::clamp(state.player.position.z, minZ, maxZ);
+  PlayerState& playerTwo = state.players[1];
+  GLFWgamepadstate gamepadState{};
+  if (glfwJoystickIsGamepad(GLFW_JOYSTICK_1) && glfwGetGamepadState(GLFW_JOYSTICK_1, &gamepadState) == GLFW_TRUE) {
+    const float moveX = applyDeadzone(gamepadState.axes[GLFW_GAMEPAD_AXIS_LEFT_X]);
+    const float moveY = applyDeadzone(-gamepadState.axes[GLFW_GAMEPAD_AXIS_LEFT_Y]);
+    const float lookX = applyDeadzone(gamepadState.axes[GLFW_GAMEPAD_AXIS_RIGHT_X]);
+    const float lookY = applyDeadzone(-gamepadState.axes[GLFW_GAMEPAD_AXIS_RIGHT_Y]);
+
+    playerTwo.avatar.yaw += lookX * kGamepadLookSpeed * deltaTime;
+    playerTwo.avatar.pitch = std::clamp(playerTwo.avatar.pitch + lookY * kGamepadLookSpeed * deltaTime,
+                                        -89.0f, 89.0f);
+
+    const glm::vec3 front = cameraFront(playerTwo.avatar);
+    glm::vec3 flatFront(front.x, 0.0f, front.z);
+    if (glm::length(flatFront) < 0.0001f) {
+      flatFront = glm::vec3(0.0f, 0.0f, -1.0f);
+    } else {
+      flatFront = glm::normalize(flatFront);
+    }
+    const glm::vec3 right = glm::normalize(glm::cross(flatFront, glm::vec3(0.0f, 1.0f, 0.0f)));
+    glm::vec3 wishDir = flatFront * moveY + right * moveX;
+    if (glm::length(wishDir) > 0.0f) {
+      wishDir = glm::normalize(wishDir);
+    }
+
+    const bool sprinting = gamepadState.buttons[GLFW_GAMEPAD_BUTTON_LEFT_THUMB] == GLFW_PRESS;
+    const bool jumpPressed = gamepadState.buttons[GLFW_GAMEPAD_BUTTON_A] == GLFW_PRESS;
+    integratePlayerMovement(playerTwo, state.world, wishDir, sprinting, jumpPressed, deltaTime);
+
+    if (gamepadState.buttons[GLFW_GAMEPAD_BUTTON_LEFT_BUMPER] == GLFW_PRESS) {
+      playerTwo.satellite.orbitYawTarget -= kSatelliteOrbitAdjustSpeed * deltaTime;
+    }
+    if (gamepadState.buttons[GLFW_GAMEPAD_BUTTON_RIGHT_BUMPER] == GLFW_PRESS) {
+      playerTwo.satellite.orbitYawTarget += kSatelliteOrbitAdjustSpeed * deltaTime;
+    }
+    if (gamepadState.buttons[GLFW_GAMEPAD_BUTTON_X] == GLFW_PRESS) {
+      playerTwo.satellite.orbitSpeedTarget -= kSatelliteOrbitSpeedAdjustRate * deltaTime;
+    }
+    if (gamepadState.buttons[GLFW_GAMEPAD_BUTTON_Y] == GLFW_PRESS) {
+      playerTwo.satellite.orbitSpeedTarget += kSatelliteOrbitSpeedAdjustRate * deltaTime;
+    }
+    playerTwo.satellite.orbitSpeedTarget =
+        std::clamp(playerTwo.satellite.orbitSpeedTarget, kSatelliteOrbitSpeedMin, kSatelliteOrbitSpeedMax);
+    if (playerTwo.satellite.orbitYawTarget > glm::pi<float>()) {
+      playerTwo.satellite.orbitYawTarget -= glm::two_pi<float>();
+    } else if (playerTwo.satellite.orbitYawTarget < -glm::pi<float>()) {
+      playerTwo.satellite.orbitYawTarget += glm::two_pi<float>();
+    }
+  } else {
+    playerTwo.jumpHeldLastFrame = false;
+  }
 
   if (state.input.captureMouse) {
     if (glfwGetKey(window, GLFW_KEY_MINUS) == GLFW_PRESS) {
-      state.satelliteOrbitYawTarget -= kSatelliteOrbitAdjustSpeed * deltaTime;
+      state.players[0].satellite.orbitYawTarget -= kSatelliteOrbitAdjustSpeed * deltaTime;
     }
     if (glfwGetKey(window, GLFW_KEY_EQUAL) == GLFW_PRESS) {
-      state.satelliteOrbitYawTarget += kSatelliteOrbitAdjustSpeed * deltaTime;
+      state.players[0].satellite.orbitYawTarget += kSatelliteOrbitAdjustSpeed * deltaTime;
     }
     if (glfwGetKey(window, GLFW_KEY_LEFT_BRACKET) == GLFW_PRESS) {
-      state.satelliteOrbitSpeedTarget -= kSatelliteOrbitSpeedAdjustRate * deltaTime;
+      state.players[0].satellite.orbitSpeedTarget -= kSatelliteOrbitSpeedAdjustRate * deltaTime;
     }
     if (glfwGetKey(window, GLFW_KEY_RIGHT_BRACKET) == GLFW_PRESS) {
-      state.satelliteOrbitSpeedTarget += kSatelliteOrbitSpeedAdjustRate * deltaTime;
+      state.players[0].satellite.orbitSpeedTarget += kSatelliteOrbitSpeedAdjustRate * deltaTime;
     }
-    state.satelliteOrbitSpeedTarget =
-        std::clamp(state.satelliteOrbitSpeedTarget, kSatelliteOrbitSpeedMin, kSatelliteOrbitSpeedMax);
-    if (state.satelliteOrbitYawTarget > glm::pi<float>()) {
-      state.satelliteOrbitYawTarget -= glm::two_pi<float>();
-    } else if (state.satelliteOrbitYawTarget < -glm::pi<float>()) {
-      state.satelliteOrbitYawTarget += glm::two_pi<float>();
+    state.players[0].satellite.orbitSpeedTarget =
+        std::clamp(state.players[0].satellite.orbitSpeedTarget, kSatelliteOrbitSpeedMin, kSatelliteOrbitSpeedMax);
+    if (state.players[0].satellite.orbitYawTarget > glm::pi<float>()) {
+      state.players[0].satellite.orbitYawTarget -= glm::two_pi<float>();
+    } else if (state.players[0].satellite.orbitYawTarget < -glm::pi<float>()) {
+      state.players[0].satellite.orbitYawTarget += glm::two_pi<float>();
     }
   }
 
-  float yawDelta = state.satelliteOrbitYawTarget - state.satelliteOrbitYaw;
-  if (yawDelta > glm::pi<float>()) {
-    yawDelta -= glm::two_pi<float>();
-  } else if (yawDelta < -glm::pi<float>()) {
-    yawDelta += glm::two_pi<float>();
-  }
-  state.satelliteOrbitYaw += yawDelta * std::min(1.0f, deltaTime * kSatelliteOrbitSmoothing);
-  if (state.satelliteOrbitYaw > glm::pi<float>()) {
-    state.satelliteOrbitYaw -= glm::two_pi<float>();
-  } else if (state.satelliteOrbitYaw < -glm::pi<float>()) {
-    state.satelliteOrbitYaw += glm::two_pi<float>();
-  }
-  state.satelliteOrbitSpeed +=
-      (state.satelliteOrbitSpeedTarget - state.satelliteOrbitSpeed) *
-      std::min(1.0f, deltaTime * kSatelliteOrbitSpeedSmoothing);
-  state.satelliteOrbitPhase += glm::two_pi<float>() * (state.satelliteOrbitSpeed / kSatelliteOrbitPeriod) * deltaTime;
-  if (state.satelliteOrbitPhase > glm::two_pi<float>()) {
-    state.satelliteOrbitPhase = std::fmod(state.satelliteOrbitPhase, glm::two_pi<float>());
+  for (PlayerState& playerState : state.players) {
+    float yawDelta = playerState.satellite.orbitYawTarget - playerState.satellite.orbitYaw;
+    if (yawDelta > glm::pi<float>()) {
+      yawDelta -= glm::two_pi<float>();
+    } else if (yawDelta < -glm::pi<float>()) {
+      yawDelta += glm::two_pi<float>();
+    }
+    playerState.satellite.orbitYaw += yawDelta * std::min(1.0f, deltaTime * kSatelliteOrbitSmoothing);
+    if (playerState.satellite.orbitYaw > glm::pi<float>()) {
+      playerState.satellite.orbitYaw -= glm::two_pi<float>();
+    } else if (playerState.satellite.orbitYaw < -glm::pi<float>()) {
+      playerState.satellite.orbitYaw += glm::two_pi<float>();
+    }
+    playerState.satellite.orbitSpeed +=
+        (playerState.satellite.orbitSpeedTarget - playerState.satellite.orbitSpeed) *
+        std::min(1.0f, deltaTime * kSatelliteOrbitSpeedSmoothing);
+    playerState.satellite.orbitPhase +=
+        glm::two_pi<float>() * (playerState.satellite.orbitSpeed / kSatelliteOrbitPeriod) * deltaTime;
+    if (playerState.satellite.orbitPhase > glm::two_pi<float>()) {
+      playerState.satellite.orbitPhase = std::fmod(playerState.satellite.orbitPhase, glm::two_pi<float>());
+    }
   }
 
-  if (playerTouchesForcefield(state.player.position)) {
-    applyPlayerDamage(state, kPlayerForcefieldFatalDamage);
-  } else if (state.player.position.y < 2.0f * kBlockSize) {
-    applyPlayerDamage(state, kPlayerVoidFatalDamage);
+  for (int playerIndex = 0; playerIndex < static_cast<int>(state.players.size()); ++playerIndex) {
+    const glm::vec3& position = state.players[static_cast<std::size_t>(playerIndex)].avatar.position;
+    const PlayerState& playerState = state.players[static_cast<std::size_t>(playerIndex)];
+    if (playerTouchesForcefield(playerState, position)) {
+      applyPlayerDamage(state, playerIndex, kPlayerForcefieldFatalDamage);
+    } else if (!playerState.invertedGravity && position.y < 2.0f * kBlockSize) {
+      applyPlayerDamage(state, playerIndex, kPlayerVoidFatalDamage);
+    } else if (playerState.invertedGravity && position.y > (static_cast<float>(kWorldY) - 2.0f) * kBlockSize) {
+      applyPlayerDamage(state, playerIndex, kPlayerVoidFatalDamage);
+    }
   }
 }
 
-void updateHoveredBlock(AppState& state) {
-  state.hoveredBlock = raycast(state.world, eyePosition(state.player), cameraFront(state.player), kReach);
+void updateHoveredBlock(AppState& state, int playerIndex) {
+  PlayerState& playerState = state.players[static_cast<std::size_t>(playerIndex)];
+  playerState.hoveredBlock = raycast(state.world, eyePosition(playerState), cameraFront(playerState.avatar), kReach);
+}
+
+void updatePlayerBlockInput(AppState& state, PlayerState& playerState, bool digPressed, bool placePressed,
+                            float deltaTime) {
+  if (digPressed) {
+    if (playerState.hoveredBlock.has_value() && playerState.hoveredBlock->block.y > 0) {
+      if (!playerState.mining.active || !sameBlock(playerState.mining.block, playerState.hoveredBlock->block)) {
+        playerState.mining.active = true;
+        playerState.mining.block = playerState.hoveredBlock->block;
+        playerState.mining.type = playerState.hoveredBlock->type;
+        playerState.mining.progress = 0.0f;
+        playerState.mining.swingCooldown = 0.0f;
+      }
+
+      playerState.mining.progress += deltaTime;
+      playerState.mining.swingCooldown -= deltaTime;
+      if (playerState.mining.swingCooldown <= 0.0f) {
+        triggerHandSwing(playerState);
+        triggerCameraThump(playerState);
+        playerState.mining.swingCooldown = kMiningSwingInterval;
+      }
+
+      if (playerState.mining.progress >= miningDurationFor(playerState.mining.type)) {
+        tryBreakBlock(state, playerState);
+      }
+    } else {
+      resetMining(playerState);
+    }
+  } else {
+    resetMining(playerState);
+  }
+
+  if (placePressed) {
+    if (playerState.hoveredBlock.has_value()) {
+      const glm::ivec3 place = playerState.hoveredBlock->previous;
+      bool canPlace =
+          state.world.inBounds(place.x, place.y, place.z) &&
+          state.world.get(place.x, place.y, place.z) == Air;
+      if (canPlace) {
+        for (const PlayerState& otherPlayer : state.players) {
+          if (playerIntersectsBlock(otherPlayer, otherPlayer.avatar.position, place)) {
+            canPlace = false;
+            break;
+          }
+        }
+      }
+      if (canPlace) {
+        if (!playerState.placing.active || !sameBlock(playerState.placing.block, place) ||
+            playerState.placing.type != playerState.selectedBlock) {
+          playerState.placing.active = true;
+          playerState.placing.block = place;
+          playerState.placing.type = playerState.selectedBlock;
+          playerState.placing.progress = 0.0f;
+          playerState.placing.swingCooldown = 0.0f;
+        }
+
+        playerState.placing.progress += deltaTime;
+        playerState.placing.swingCooldown -= deltaTime;
+        if (playerState.placing.swingCooldown <= 0.0f) {
+          triggerHandSwing(playerState);
+          triggerCameraThump(playerState);
+          playerState.placing.swingCooldown = kPlacementSwingInterval;
+        }
+
+        if (playerState.placing.progress >= placementDurationFor(playerState.placing.type)) {
+          tryPlaceBlock(state, playerState);
+          resetMining(playerState);
+        }
+      } else {
+        resetPlacement(playerState);
+      }
+    } else {
+      resetPlacement(playerState);
+    }
+  } else {
+    resetPlacement(playerState);
+  }
 }
 
 void handleBlockInput(GLFWwindow* window, AppState& state, float deltaTime) {
   const bool leftPressed = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
   const bool rightPressed = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
+  PlayerState& playerOne = state.players[0];
   if (state.input.captureMouse) {
-    if (leftPressed) {
-      if (state.hoveredBlock.has_value() && state.hoveredBlock->block.y > 0) {
-        if (!state.mining.active || !sameBlock(state.mining.block, state.hoveredBlock->block)) {
-          state.mining.active = true;
-          state.mining.block = state.hoveredBlock->block;
-          state.mining.type = state.hoveredBlock->type;
-          state.mining.progress = 0.0f;
-          state.mining.swingCooldown = 0.0f;
-        }
-
-        state.mining.progress += deltaTime;
-        state.mining.swingCooldown -= deltaTime;
-        if (state.mining.swingCooldown <= 0.0f) {
-          triggerHandSwing(state);
-          triggerCameraThump(state);
-          state.mining.swingCooldown = kMiningSwingInterval;
-        }
-
-        if (state.mining.progress >= miningDurationFor(state.mining.type)) {
-          tryBreakBlock(state);
-          updateHoveredBlock(state);
-        }
-      } else {
-        resetMining(state);
-      }
-    } else {
-      resetMining(state);
-    }
-    if (rightPressed) {
-      if (state.hoveredBlock.has_value()) {
-        const glm::ivec3 place = state.hoveredBlock->previous;
-        const bool canPlace =
-            state.world.inBounds(place.x, place.y, place.z) &&
-            state.world.get(place.x, place.y, place.z) == Air &&
-            !playerIntersectsBlock(state.player.position, place);
-        if (canPlace) {
-          if (!state.placing.active || !sameBlock(state.placing.block, place) || state.placing.type != state.selectedBlock) {
-            state.placing.active = true;
-            state.placing.block = place;
-            state.placing.type = state.selectedBlock;
-            state.placing.progress = 0.0f;
-            state.placing.swingCooldown = 0.0f;
-          }
-
-          state.placing.progress += deltaTime;
-          state.placing.swingCooldown -= deltaTime;
-          if (state.placing.swingCooldown <= 0.0f) {
-            triggerHandSwing(state);
-            triggerCameraThump(state);
-            state.placing.swingCooldown = kPlacementSwingInterval;
-          }
-
-          if (state.placing.progress >= placementDurationFor(state.placing.type)) {
-            tryPlaceBlock(state);
-            updateHoveredBlock(state);
-            resetMining(state);
-          }
-        } else {
-          resetPlacement(state);
-        }
-      } else {
-        resetPlacement(state);
-      }
-    } else {
-      resetPlacement(state);
-    }
+    updatePlayerBlockInput(state, playerOne, leftPressed, rightPressed, deltaTime);
   } else {
-    resetMining(state);
-    resetPlacement(state);
+    resetMining(playerOne);
+    resetPlacement(playerOne);
   }
 
   state.input.leftPressedLastFrame = leftPressed;
   state.input.rightPressedLastFrame = rightPressed;
 
-  if (glfwGetKey(window, GLFW_KEY_1) == GLFW_PRESS) state.selectedBlock = Crust;
-  if (glfwGetKey(window, GLFW_KEY_2) == GLFW_PRESS) state.selectedBlock = DarkRock;
-  if (glfwGetKey(window, GLFW_KEY_3) == GLFW_PRESS) state.selectedBlock = Ember;
+  if (glfwGetKey(window, GLFW_KEY_1) == GLFW_PRESS) playerOne.selectedBlock = Crust;
+  if (glfwGetKey(window, GLFW_KEY_2) == GLFW_PRESS) playerOne.selectedBlock = DarkRock;
+  if (glfwGetKey(window, GLFW_KEY_3) == GLFW_PRESS) playerOne.selectedBlock = Ember;
+
+  GLFWgamepadstate gamepadState{};
+  PlayerState& playerTwo = state.players[1];
+  if (glfwJoystickIsGamepad(GLFW_JOYSTICK_1) && glfwGetGamepadState(GLFW_JOYSTICK_1, &gamepadState) == GLFW_TRUE) {
+    const bool digPressed = gamepadState.axes[GLFW_GAMEPAD_AXIS_RIGHT_TRIGGER] > 0.45f;
+    const bool placePressed = gamepadState.axes[GLFW_GAMEPAD_AXIS_LEFT_TRIGGER] > 0.45f;
+    updatePlayerBlockInput(state, playerTwo, digPressed, placePressed, deltaTime);
+
+    const bool leftSelect = gamepadState.buttons[GLFW_GAMEPAD_BUTTON_DPAD_LEFT] == GLFW_PRESS;
+    const bool upSelect = gamepadState.buttons[GLFW_GAMEPAD_BUTTON_DPAD_UP] == GLFW_PRESS;
+    const bool rightSelect = gamepadState.buttons[GLFW_GAMEPAD_BUTTON_DPAD_RIGHT] == GLFW_PRESS;
+    if (leftSelect && !playerTwo.blockCycleLeftLastFrame) playerTwo.selectedBlock = Crust;
+    if (upSelect && !playerTwo.blockCycleUpLastFrame) playerTwo.selectedBlock = DarkRock;
+    if (rightSelect && !playerTwo.blockCycleRightLastFrame) playerTwo.selectedBlock = Ember;
+    playerTwo.blockCycleLeftLastFrame = leftSelect;
+    playerTwo.blockCycleUpLastFrame = upSelect;
+    playerTwo.blockCycleRightLastFrame = rightSelect;
+  } else {
+    resetMining(playerTwo);
+    resetPlacement(playerTwo);
+    playerTwo.blockCycleLeftLastFrame = false;
+    playerTwo.blockCycleUpLastFrame = false;
+    playerTwo.blockCycleRightLastFrame = false;
+  }
 }
 
 void handleAtomicBombInput(GLFWwindow* window, AppState& state) {
   const bool bombPressed = glfwGetKey(window, GLFW_KEY_P) == GLFW_PRESS;
   if (state.input.captureMouse && bombPressed && !state.input.atomicBombPressedLastFrame) {
-    dropAtomicBomb(state);
+    dropAtomicBomb(state, 0);
   }
   state.input.atomicBombPressedLastFrame = bombPressed;
+
+  GLFWgamepadstate gamepadState{};
+  static bool playerTwoBombPressedLastFrame = false;
+  const bool playerTwoBombPressed =
+      glfwJoystickIsGamepad(GLFW_JOYSTICK_1) &&
+      glfwGetGamepadState(GLFW_JOYSTICK_1, &gamepadState) == GLFW_TRUE &&
+      gamepadState.buttons[GLFW_GAMEPAD_BUTTON_B] == GLFW_PRESS;
+  if (playerTwoBombPressed && !playerTwoBombPressedLastFrame) {
+    dropAtomicBomb(state, 1);
+  }
+  playerTwoBombPressedLastFrame = playerTwoBombPressed;
 }
 
 GLuint createOutlineVao(GLuint& vbo) {
@@ -1997,33 +2240,33 @@ GLuint createDynamicLineVao(GLuint& vbo, int pointCount) {
   return vao;
 }
 
-void triggerHandSwing(AppState& state) {
-  state.hand.swinging = true;
-  state.hand.swingTime = 0.0f;
+void triggerHandSwing(PlayerState& playerState) {
+  playerState.hand.swinging = true;
+  playerState.hand.swingTime = 0.0f;
 }
 
-void triggerCameraThump(AppState& state) {
-  state.cameraFx.thumping = true;
-  state.cameraFx.thumpTime = 0.0f;
+void triggerCameraThump(PlayerState& playerState) {
+  playerState.cameraFx.thumping = true;
+  playerState.cameraFx.thumpTime = 0.0f;
 }
 
-void triggerCameraSnap(AppState& state) {
-  state.cameraFx.snapping = true;
-  state.cameraFx.snapTime = 0.0f;
+void triggerCameraSnap(PlayerState& playerState) {
+  playerState.cameraFx.snapping = true;
+  playerState.cameraFx.snapTime = 0.0f;
 }
 
-void resetMining(AppState& state) {
-  state.mining.active = false;
-  state.mining.progress = 0.0f;
-  state.mining.swingCooldown = 0.0f;
-  state.mining.type = Air;
+void resetMining(PlayerState& playerState) {
+  playerState.mining.active = false;
+  playerState.mining.progress = 0.0f;
+  playerState.mining.swingCooldown = 0.0f;
+  playerState.mining.type = Air;
 }
 
-void resetPlacement(AppState& state) {
-  state.placing.active = false;
-  state.placing.progress = 0.0f;
-  state.placing.swingCooldown = 0.0f;
-  state.placing.type = Air;
+void resetPlacement(PlayerState& playerState) {
+  playerState.placing.active = false;
+  playerState.placing.progress = 0.0f;
+  playerState.placing.swingCooldown = 0.0f;
+  playerState.placing.type = Air;
 }
 
 }  // namespace
@@ -2058,10 +2301,27 @@ int main() {
     return 1;
   }
 
+  {
+    unsigned char hiddenPixel[4] = {0, 0, 0, 0};
+    GLFWimage hiddenCursorImage{};
+    hiddenCursorImage.width = 1;
+    hiddenCursorImage.height = 1;
+    hiddenCursorImage.pixels = hiddenPixel;
+    gHiddenCursor = glfwCreateCursor(&hiddenCursorImage, 0, 0);
+  }
+
   AppState state;
   generateWorld(state.world);
-  state.spawnPosition = findSpawnPosition(state.world);
-  state.player.position = state.spawnPosition;
+  state.spawnPositions[0] = findSpawnPosition(state.world);
+  state.players[0].avatar.position = state.spawnPositions[0];
+  state.players[1].invertedGravity = true;
+  state.spawnPositions[1] = findInvertedSpawnPosition(state.world);
+  state.players[1].avatar.position = state.spawnPositions[1];
+  state.players[1].avatar.yaw = 90.0f;
+  state.players[1].avatar.pitch = -12.0f;
+  state.players[1].satellite.orbitYaw = glm::half_pi<float>();
+  state.players[1].satellite.orbitYawTarget = glm::half_pi<float>();
+  state.players[1].satellite.orbitPhase = glm::pi<float>() * 0.75f;
   markAllChunksDirty(state);
   gState = &state;
   glfwSetCursorPosCallback(window, mouseCallback);
@@ -2109,11 +2369,14 @@ int main() {
     lastFrame = currentFrame;
 
     updateMovement(window, state, deltaTime);
-    updateHoveredBlock(state);
+    updateHoveredBlock(state, 0);
+    updateHoveredBlock(state, 1);
     handleBlockInput(window, state, deltaTime);
     handleAtomicBombInput(window, state);
-    updateHand(state, deltaTime);
-    updateCameraFeedback(state, deltaTime);
+    updateHand(state.players[0], deltaTime);
+    updateHand(state.players[1], deltaTime);
+    updateCameraFeedback(state.players[0], deltaTime);
+    updateCameraFeedback(state.players[1], deltaTime);
     updateAtomicBomb(state, deltaTime);
     updateSatelliteFuel(state, deltaTime);
     rebuildDirtyChunks(state);
@@ -2121,31 +2384,8 @@ int main() {
     int width = 0;
     int height = 0;
     glfwGetFramebufferSize(window, &width, &height);
-    const float aspect = height > 0 ? static_cast<float>(width) / static_cast<float>(height) : 1.0f;
-
     glViewport(0, 0, width, height);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
-    glDisable(GL_DEPTH_TEST);
-    glUseProgram(skyProgram);
-    glUniform1f(glGetUniformLocation(skyProgram, "uTime"), currentFrame);
-    glBindVertexArray(skyVao);
-    glDrawArrays(GL_TRIANGLES, 0, 3);
-    glEnable(GL_DEPTH_TEST);
-
-    glm::vec3 eye = eyePosition(state.player);
-    if (state.cameraFx.thumping) {
-      const float t = state.cameraFx.thumpTime / kCameraThumpDuration;
-      const float pulse = std::sin(t * 3.14159265f);
-      eye += glm::vec3(0.0f, -0.18f * kBlockSize * pulse, 0.0f);
-    }
-    if (state.cameraFx.snapping) {
-      const float t = state.cameraFx.snapTime / kCameraSnapDuration;
-      const float pulse = std::sin(t * 3.14159265f);
-      eye += glm::vec3(0.0f, -0.28f * kBlockSize * pulse, -0.10f * kBlockSize * pulse);
-    }
-    const glm::mat4 projection = glm::perspective(glm::radians(72.0f), aspect, 0.1f, 240.0f);
-    const glm::mat4 view = glm::lookAt(eye, eye + cameraFront(state.player), glm::vec3(0.0f, 1.0f, 0.0f));
     const glm::mat4 identity(1.0f);
     const auto drawWorld = [&](const glm::mat4& drawView,
                                const glm::mat4& drawProjection,
@@ -2185,26 +2425,92 @@ int main() {
       const float fieldWidth = static_cast<float>(kWorldX) * kBlockSize * kForcefieldOversize;
       const float fieldDepth = static_cast<float>(kWorldZ) * kBlockSize * kForcefieldOversize;
       const float fieldPulse = 0.82f + std::sin(currentFrame * 1.9f) * 0.18f;
-      const glm::mat4 forcefieldModel =
+      const float fieldSnarl = 0.5f + 0.5f * std::sin(currentFrame * 7.5f);
+      const glm::mat4 forcefieldCoreModel =
           glm::translate(glm::mat4(1.0f),
                          center - glm::vec3(fieldWidth * 0.5f, kForcefieldThickness * 0.5f, fieldDepth * 0.5f)) *
           glm::scale(glm::mat4(1.0f), glm::vec3(fieldWidth, kForcefieldThickness, fieldDepth));
+      const glm::mat4 forcefieldHaloModel =
+          glm::translate(glm::mat4(1.0f),
+                         center - glm::vec3(fieldWidth * 0.515f, kForcefieldThickness * 1.4f, fieldDepth * 0.515f)) *
+          glm::scale(glm::mat4(1.0f), glm::vec3(fieldWidth * 1.03f, kForcefieldThickness * 2.8f, fieldDepth * 1.03f));
 
       glUseProgram(colorProgram);
       glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uView"), 1, GL_FALSE, glm::value_ptr(drawView));
       glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uProjection"), 1, GL_FALSE, glm::value_ptr(drawProjection));
-      glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(forcefieldModel));
       glBindVertexArray(solidCubeVao);
       glDisable(GL_CULL_FACE);
       if (alwaysVisible) {
         glDisable(GL_DEPTH_TEST);
         glDepthMask(GL_FALSE);
       }
+
+      glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(forcefieldHaloModel));
       glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
-                  0.18f * fieldPulse * brightness,
-                  1.00f * fieldPulse * brightness,
-                  0.24f * fieldPulse * brightness);
+                  0.06f * fieldPulse * brightness,
+                  0.42f * fieldPulse * brightness,
+                  0.04f * fieldPulse * brightness);
       glDrawArrays(GL_TRIANGLES, 0, 36);
+
+      glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(forcefieldCoreModel));
+      glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
+                  0.03f * fieldPulse * brightness,
+                  0.16f * fieldPulse * brightness,
+                  0.02f * fieldPulse * brightness);
+      glDrawArrays(GL_TRIANGLES, 0, 36);
+
+      const glm::mat4 forcefieldSkinModel =
+          glm::translate(glm::mat4(1.0f),
+                         center - glm::vec3(fieldWidth * 0.5f, kForcefieldThickness * 0.72f, fieldDepth * 0.5f)) *
+          glm::scale(glm::mat4(1.0f), glm::vec3(fieldWidth, kForcefieldThickness * 1.44f, fieldDepth));
+      glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(forcefieldSkinModel));
+      glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
+                  0.22f * fieldPulse * brightness,
+                  0.95f * fieldPulse * brightness,
+                  0.12f * fieldPulse * brightness);
+      glDrawArrays(GL_TRIANGLES, 0, 36);
+
+      glBindVertexArray(orbitLineVao);
+      glBindBuffer(GL_ARRAY_BUFFER, orbitLineVbo);
+      glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(identity));
+
+      std::array<glm::vec3, 10> edgeRings{};
+      const float ringYTop = center.y + kForcefieldThickness * (0.52f + fieldSnarl * 0.08f);
+      const float ringYBottom = center.y - kForcefieldThickness * (0.52f + fieldSnarl * 0.08f);
+      edgeRings[0] = glm::vec3(center.x - fieldWidth * 0.5f, ringYTop, center.z - fieldDepth * 0.5f);
+      edgeRings[1] = glm::vec3(center.x + fieldWidth * 0.5f, ringYTop, center.z - fieldDepth * 0.5f);
+      edgeRings[2] = glm::vec3(center.x + fieldWidth * 0.5f, ringYTop, center.z + fieldDepth * 0.5f);
+      edgeRings[3] = glm::vec3(center.x - fieldWidth * 0.5f, ringYTop, center.z + fieldDepth * 0.5f);
+      edgeRings[4] = edgeRings[0];
+      edgeRings[5] = glm::vec3(center.x - fieldWidth * 0.5f, ringYBottom, center.z - fieldDepth * 0.5f);
+      edgeRings[6] = glm::vec3(center.x + fieldWidth * 0.5f, ringYBottom, center.z - fieldDepth * 0.5f);
+      edgeRings[7] = glm::vec3(center.x + fieldWidth * 0.5f, ringYBottom, center.z + fieldDepth * 0.5f);
+      edgeRings[8] = glm::vec3(center.x - fieldWidth * 0.5f, ringYBottom, center.z + fieldDepth * 0.5f);
+      edgeRings[9] = edgeRings[5];
+      glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(edgeRings), edgeRings.data());
+      glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
+                  0.56f * fieldPulse * brightness,
+                  1.00f * fieldPulse * brightness,
+                  0.20f * fieldPulse * brightness);
+      glDrawArrays(GL_LINE_STRIP, 0, 5);
+      glDrawArrays(GL_LINE_STRIP, 5, 5);
+
+      std::array<glm::vec3, 18> scarLines{};
+      for (int i = 0; i < 9; ++i) {
+        const float z = center.z - fieldDepth * 0.46f + fieldDepth * 0.92f * (static_cast<float>(i) / 8.0f);
+        const float xJitter = std::sin(currentFrame * 8.0f + static_cast<float>(i) * 0.9f) * fieldWidth * 0.045f;
+        scarLines[static_cast<std::size_t>(i * 2)] =
+            glm::vec3(center.x - fieldWidth * 0.48f + xJitter, center.y + kForcefieldThickness * (0.15f + 0.35f * std::sin(currentFrame * 5.0f + i)), z);
+        scarLines[static_cast<std::size_t>(i * 2 + 1)] =
+            glm::vec3(center.x + fieldWidth * 0.48f - xJitter, center.y - kForcefieldThickness * (0.15f + 0.35f * std::cos(currentFrame * 4.0f + i)), z);
+      }
+      glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(scarLines), scarLines.data());
+      glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
+                  0.72f * fieldPulse * brightness,
+                  1.00f * fieldPulse * brightness,
+                  0.28f * fieldPulse * brightness);
+      glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(scarLines.size()));
+
       if (alwaysVisible) {
         glDepthMask(GL_TRUE);
         glEnable(GL_DEPTH_TEST);
@@ -2220,6 +2526,9 @@ int main() {
       glBindVertexArray(solidCubeVao);
 
       if (state.atomicBomb.active || state.atomicBomb.bouncing) {
+        const bool bombFromBlueSide = state.atomicBomb.ownerIndex == 1;
+        const glm::vec3 shellColor = bombFromBlueSide ? glm::vec3(0.10f, 0.16f, 0.24f) : glm::vec3(0.11f, 0.14f, 0.10f);
+        const glm::vec3 coreColor = bombFromBlueSide ? glm::vec3(0.62f, 0.92f, 1.0f) : glm::vec3(1.0f, 0.78f, 0.28f);
         const glm::mat4 bombModel =
             glm::translate(glm::mat4(1.0f), state.atomicBomb.position - glm::vec3(kAtomicBombSize * 0.5f)) *
             glm::scale(glm::mat4(1.0f), glm::vec3(kAtomicBombSize));
@@ -2229,7 +2538,7 @@ int main() {
                                                          glm::two_pi<float>() * 7.5f)
                                       : 0.0f;
         glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
-                    0.11f + bounceFlash, 0.14f + bounceFlash * 0.8f, 0.10f + bounceFlash * 0.4f);
+                    shellColor.x + bounceFlash, shellColor.y + bounceFlash * 0.8f, shellColor.z + bounceFlash * 0.4f);
         glDrawArrays(GL_TRIANGLES, 0, 36);
 
         const glm::mat4 coreModel =
@@ -2237,9 +2546,9 @@ int main() {
             glm::scale(glm::mat4(1.0f), glm::vec3(kAtomicBombSize * 0.44f));
         glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(coreModel));
         glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
-                    1.0f,
-                    0.78f + bounceFlash * 1.6f,
-                    0.28f + bounceFlash * 0.6f);
+                    coreColor.x,
+                    coreColor.y + bounceFlash * 1.2f,
+                    coreColor.z + bounceFlash * 0.6f);
         glDrawArrays(GL_TRIANGLES, 0, 36);
 
         if (state.atomicBomb.trailCount >= 2) {
@@ -2250,7 +2559,10 @@ int main() {
                           state.atomicBomb.trail.data());
           glDisable(GL_CULL_FACE);
           glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(identity));
-          glUniform3f(glGetUniformLocation(colorProgram, "uColor"), 1.0f, 0.72f, 0.16f);
+          glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
+                      bombFromBlueSide ? 0.54f : 1.0f,
+                      bombFromBlueSide ? 0.92f : 0.72f,
+                      bombFromBlueSide ? 1.0f : 0.16f);
           glDrawArrays(GL_LINE_STRIP, 0, state.atomicBomb.trailCount);
           glEnable(GL_CULL_FACE);
         }
@@ -2371,18 +2683,78 @@ int main() {
       }
     };
 
-    drawWorld(view, projection, eye, glm::vec3(0.23f, 0.05f, 0.04f), 1.0f, 0.013f);
-    drawForcefield(view, projection, 1.0f, false);
-    drawAtomicBomb(view, projection);
-
-    {
-        std::array<glm::vec3, kSatelliteOrbitSegments + 1> orbitPoints{};
-        for (int i = 0; i <= kSatelliteOrbitSegments; ++i) {
-          const float t = static_cast<float>(i) / static_cast<float>(kSatelliteOrbitSegments);
-          const float angle = t * glm::two_pi<float>();
-          orbitPoints[static_cast<std::size_t>(i)] =
-              satellitePositionAtAngle(angle, state.satelliteOrbitYaw, state.satelliteOrbitSpeed);
+    const auto drawPlayerBodies = [&](int viewerIndex, const glm::mat4& drawView, const glm::mat4& drawProjection) {
+      glUseProgram(colorProgram);
+      glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uView"), 1, GL_FALSE, glm::value_ptr(drawView));
+      glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uProjection"), 1, GL_FALSE, glm::value_ptr(drawProjection));
+      glBindVertexArray(solidCubeVao);
+      for (int playerIndex = 0; playerIndex < static_cast<int>(state.players.size()); ++playerIndex) {
+        if (playerIndex == viewerIndex) {
+          continue;
         }
+        const Player& player = state.players[static_cast<std::size_t>(playerIndex)].avatar;
+        const bool inverted = state.players[static_cast<std::size_t>(playerIndex)].invertedGravity;
+        const glm::vec3 bodyColor =
+            playerIndex == 0 ? glm::vec3(0.96f, 0.56f, 0.36f) : glm::vec3(0.36f, 0.76f, 1.0f);
+        const glm::mat4 bodyModel =
+            glm::translate(glm::mat4(1.0f),
+                           player.position +
+                               glm::vec3(-0.38f * kBlockSize, inverted ? -1.10f * kBlockSize : 0.0f,
+                                         -0.22f * kBlockSize)) *
+            glm::scale(glm::mat4(1.0f), glm::vec3(0.76f * kBlockSize, 1.10f * kBlockSize, 0.44f * kBlockSize));
+        glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(bodyModel));
+        glUniform3f(glGetUniformLocation(colorProgram, "uColor"), bodyColor.x, bodyColor.y, bodyColor.z);
+        glDrawArrays(GL_TRIANGLES, 0, 36);
+
+        const glm::mat4 headModel =
+            glm::translate(glm::mat4(1.0f),
+                           player.position +
+                               glm::vec3(-0.22f * kBlockSize, inverted ? -1.56f * kBlockSize : 1.12f * kBlockSize,
+                                         -0.22f * kBlockSize)) *
+            glm::scale(glm::mat4(1.0f), glm::vec3(0.44f * kBlockSize));
+        glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(headModel));
+        glUniform3f(glGetUniformLocation(colorProgram, "uColor"), 0.86f, 0.68f, 0.56f);
+        glDrawArrays(GL_TRIANGLES, 0, 36);
+      }
+    };
+
+    const auto renderPlayerViewport = [&](int playerIndex, int viewportX, int viewportY, int viewportWidth,
+                                          int viewportHeight) {
+      PlayerState& playerState = state.players[static_cast<std::size_t>(playerIndex)];
+      const float aspect = viewportHeight > 0 ? static_cast<float>(viewportWidth) / static_cast<float>(viewportHeight) : 1.0f;
+
+      glEnable(GL_SCISSOR_TEST);
+      glViewport(viewportX, viewportY, viewportWidth, viewportHeight);
+      glScissor(viewportX, viewportY, viewportWidth, viewportHeight);
+      glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+      glDisable(GL_DEPTH_TEST);
+      glUseProgram(skyProgram);
+      glUniform1f(glGetUniformLocation(skyProgram, "uTime"), currentFrame);
+      glBindVertexArray(skyVao);
+      glDrawArrays(GL_TRIANGLES, 0, 3);
+      glEnable(GL_DEPTH_TEST);
+
+      glm::vec3 eye = eyePosition(playerState);
+      if (playerState.cameraFx.thumping) {
+        const float t = playerState.cameraFx.thumpTime / kCameraThumpDuration;
+        const float pulse = std::sin(t * 3.14159265f);
+        eye += glm::vec3(0.0f, -0.18f * kBlockSize * pulse, 0.0f);
+      }
+      if (playerState.cameraFx.snapping) {
+        const float t = playerState.cameraFx.snapTime / kCameraSnapDuration;
+        const float pulse = std::sin(t * 3.14159265f);
+        eye += glm::vec3(0.0f, -0.28f * kBlockSize * pulse, -0.10f * kBlockSize * pulse);
+      }
+      const glm::mat4 projection = glm::perspective(glm::radians(72.0f), aspect, 0.1f, 240.0f);
+      const glm::mat4 view =
+          glm::lookAt(eye, eye + cameraFront(playerState.avatar), viewUpVector(playerState));
+
+      drawWorld(view, projection, eye, glm::vec3(0.23f, 0.05f, 0.04f), 1.0f, 0.013f);
+      drawForcefield(view, projection, 1.0f, false);
+      drawAtomicBomb(view, projection);
+      drawPlayerBodies(playerIndex, view, projection);
+      const float blinkPhase = std::sin((currentFrame / kSatelliteBlinkPeriod) * glm::two_pi<float>()) * 0.5f + 0.5f;
 
       glUseProgram(colorProgram);
       glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uView"), 1, GL_FALSE, glm::value_ptr(view));
@@ -2390,120 +2762,227 @@ int main() {
       glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(identity));
       glBindVertexArray(orbitLineVao);
       glBindBuffer(GL_ARRAY_BUFFER, orbitLineVbo);
-      glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(glm::vec3) * orbitPoints.size(), orbitPoints.data());
       glDisable(GL_CULL_FACE);
-      glUniform3f(glGetUniformLocation(colorProgram, "uColor"), 0.72f, 0.26f, 0.14f);
-      glDrawArrays(GL_LINE_STRIP, 0, static_cast<GLsizei>(orbitPoints.size()));
+      for (int satelliteIndex = 0; satelliteIndex < static_cast<int>(state.players.size()); ++satelliteIndex) {
+        glBindVertexArray(orbitLineVao);
+        glBindBuffer(GL_ARRAY_BUFFER, orbitLineVbo);
+        glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(identity));
+        const PlayerState& satelliteOwner = state.players[static_cast<std::size_t>(satelliteIndex)];
+        const SatelliteState& satellite = satelliteOwner.satellite;
+        const glm::vec3 pathColor =
+            satelliteIndex == 0 ? glm::vec3(0.92f, 0.28f, 0.10f) : glm::vec3(0.16f, 0.50f, 1.0f);
+        std::array<glm::vec3, kSatelliteOrbitSegments + 1> orbitPoints{};
+        for (int i = 0; i <= kSatelliteOrbitSegments; ++i) {
+          const float t = static_cast<float>(i) / static_cast<float>(kSatelliteOrbitSegments);
+          const float angle = t * glm::two_pi<float>();
+          orbitPoints[static_cast<std::size_t>(i)] =
+              satellitePositionAtAngle(angle, satellite.orbitYaw, satellite.orbitSpeed);
+        }
+        glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(glm::vec3) * orbitPoints.size(), orbitPoints.data());
+        glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
+                    pathColor.x * 0.55f, pathColor.y * 0.55f, pathColor.z * 0.55f);
+        glDrawArrays(GL_LINE_STRIP, 0, static_cast<GLsizei>(orbitPoints.size()));
+        glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
+                    std::min(1.0f, pathColor.x * 1.15f),
+                    std::min(1.0f, pathColor.y * 1.15f),
+                    std::min(1.0f, pathColor.z * 1.15f));
+        glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(orbitPoints.size()));
+
+        const glm::vec3 satellitePos =
+            satellitePositionAtAngle(satellite.orbitPhase, satellite.orbitYaw, satellite.orbitSpeed);
+        const glm::vec3 bodyColor =
+            satelliteIndex == 0 ? glm::vec3(0.84f, 0.34f, 0.10f) : glm::vec3(0.18f, 0.56f, 0.96f);
+        const glm::vec3 beaconColor =
+            satelliteIndex == 0 ? glm::vec3(1.0f, 0.64f, 0.20f) : glm::vec3(0.66f, 0.90f, 1.0f);
+        const glm::vec3 glowColor =
+            satelliteIndex == 0 ? glm::vec3(1.0f, 0.44f, 0.14f) : glm::vec3(0.42f, 0.78f, 1.0f);
+        const glm::vec3 orbitNormal = glm::normalize(satellitePos - worldCenter());
+        glm::vec3 orbitTangentLive = satelliteTangentAtAngle(satellite.orbitPhase, satellite.orbitYaw, satellite.orbitSpeed);
+        orbitTangentLive = glm::normalize(orbitTangentLive - orbitNormal * glm::dot(orbitTangentLive, orbitNormal));
+        glm::vec3 orbitBinormal = glm::cross(orbitNormal, orbitTangentLive);
+        if (glm::dot(orbitBinormal, orbitBinormal) < 0.0001f) {
+          orbitBinormal = glm::vec3(1.0f, 0.0f, 0.0f);
+        } else {
+          orbitBinormal = glm::normalize(orbitBinormal);
+        }
+        const glm::mat4 satelliteModel =
+            glm::translate(glm::mat4(1.0f), satellitePos - glm::vec3(kSatelliteSize * 0.62f)) *
+            glm::scale(glm::mat4(1.0f), glm::vec3(kSatelliteSize * 1.24f));
+        glBindVertexArray(solidCubeVao);
+
+        const glm::mat4 haloModel =
+            glm::translate(glm::mat4(1.0f), satellitePos - glm::vec3(kSatelliteSize * 1.20f)) *
+            glm::scale(glm::mat4(1.0f), glm::vec3(kSatelliteSize * (2.40f + blinkPhase * 0.34f)));
+        glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(haloModel));
+        glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
+                    glowColor.x * 0.54f, glowColor.y * 0.54f, glowColor.z * 0.54f);
+        glDrawArrays(GL_TRIANGLES, 0, 36);
+
+        const glm::mat4 haloCoreModel =
+            glm::translate(glm::mat4(1.0f), satellitePos - glm::vec3(kSatelliteSize * 0.88f)) *
+            glm::scale(glm::mat4(1.0f), glm::vec3(kSatelliteSize * (1.76f + blinkPhase * 0.28f)));
+        glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(haloCoreModel));
+        glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
+                    glowColor.x * 0.78f, glowColor.y * 0.78f, glowColor.z * 0.78f);
+        glDrawArrays(GL_TRIANGLES, 0, 36);
+
+        glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(satelliteModel));
+        glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
+                    bodyColor.x + blinkPhase * 0.18f, bodyColor.y + blinkPhase * 0.16f, bodyColor.z);
+        glDrawArrays(GL_TRIANGLES, 0, 36);
+
+        const glm::mat4 coreModel =
+            glm::translate(glm::mat4(1.0f), satellitePos - glm::vec3(kSatelliteSize * 0.34f)) *
+            glm::scale(glm::mat4(1.0f), glm::vec3(kSatelliteSize * 0.68f));
+        glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(coreModel));
+        glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
+                    std::min(1.0f, glowColor.x + 0.22f),
+                    std::min(1.0f, glowColor.y + 0.16f),
+                    std::min(1.0f, glowColor.z + 0.10f));
+        glDrawArrays(GL_TRIANGLES, 0, 36);
+
+        const glm::mat4 leftWingModel =
+            glm::translate(glm::mat4(1.0f), satellitePos - orbitBinormal * (kSatelliteSize * 1.55f) - orbitNormal * (kSatelliteSize * 0.18f) - glm::vec3(kSatelliteSize * 0.72f)) *
+            glm::scale(glm::mat4(1.0f), glm::vec3(kSatelliteSize * 1.44f, kSatelliteSize * 0.30f, kSatelliteSize * 1.44f));
+        glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(leftWingModel));
+        glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
+                    bodyColor.x * 0.75f, bodyColor.y * 0.75f, bodyColor.z * 0.82f);
+        glDrawArrays(GL_TRIANGLES, 0, 36);
+
+        const glm::mat4 rightWingModel =
+            glm::translate(glm::mat4(1.0f), satellitePos + orbitBinormal * (kSatelliteSize * 1.55f) - orbitNormal * (kSatelliteSize * 0.18f) - glm::vec3(kSatelliteSize * 0.72f)) *
+            glm::scale(glm::mat4(1.0f), glm::vec3(kSatelliteSize * 1.44f, kSatelliteSize * 0.30f, kSatelliteSize * 1.44f));
+        glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(rightWingModel));
+        glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
+                    bodyColor.x * 0.75f, bodyColor.y * 0.75f, bodyColor.z * 0.82f);
+        glDrawArrays(GL_TRIANGLES, 0, 36);
+
+        const glm::mat4 prowModel =
+            glm::translate(glm::mat4(1.0f), satellitePos + orbitTangentLive * (kSatelliteSize * 1.48f) - glm::vec3(kSatelliteSize * 0.40f)) *
+            glm::scale(glm::mat4(1.0f), glm::vec3(kSatelliteSize * 0.80f));
+        glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(prowModel));
+        glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
+                    std::min(1.0f, beaconColor.x), std::min(1.0f, beaconColor.y), std::min(1.0f, beaconColor.z));
+        glDrawArrays(GL_TRIANGLES, 0, 36);
+
+        const glm::mat4 aftModel =
+            glm::translate(glm::mat4(1.0f), satellitePos - orbitTangentLive * (kSatelliteSize * 1.42f) - glm::vec3(kSatelliteSize * 0.32f)) *
+            glm::scale(glm::mat4(1.0f), glm::vec3(kSatelliteSize * 0.64f));
+        glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(aftModel));
+        glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
+                    glowColor.x * 0.92f, glowColor.y * 0.92f, glowColor.z * 0.92f);
+        glDrawArrays(GL_TRIANGLES, 0, 36);
+
+        const glm::vec3 beaconOffset(0.22f * kBlockSize, 0.22f * kBlockSize, 0.0f);
+        const glm::mat4 beaconModel =
+            glm::translate(glm::mat4(1.0f), satellitePos + beaconOffset - glm::vec3(kSatelliteBeaconSize * 0.5f)) *
+            glm::scale(glm::mat4(1.0f), glm::vec3(kSatelliteBeaconSize * (0.75f + blinkPhase * 0.65f)));
+        glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(beaconModel));
+        glUniform3f(glGetUniformLocation(colorProgram, "uColor"), beaconColor.x, beaconColor.y, beaconColor.z);
+        glDrawArrays(GL_TRIANGLES, 0, 36);
+
+        const int trailPips = 20;
+        for (int pip = 0; pip < trailPips; ++pip) {
+          const float behind = static_cast<float>(pip) / static_cast<float>(trailPips - 1);
+          float pipAngle = satellite.orbitPhase - behind * 0.58f * glm::two_pi<float>();
+          if (pipAngle < 0.0f) {
+            pipAngle += glm::two_pi<float>();
+          }
+          const glm::vec3 pipPos = satellitePositionAtAngle(pipAngle, satellite.orbitYaw, satellite.orbitSpeed);
+          const glm::vec3 pipNormal = glm::normalize(pipPos - worldCenter());
+          glm::vec3 pipTangent = satelliteTangentAtAngle(pipAngle, satellite.orbitYaw, satellite.orbitSpeed);
+          pipTangent = glm::normalize(pipTangent - pipNormal * glm::dot(pipTangent, pipNormal));
+          const float pipScale = kSatelliteBeaconSize * (1.35f - behind * 0.72f) * (1.0f + blinkPhase * 0.24f);
+          const glm::mat4 pipModel =
+              glm::translate(glm::mat4(1.0f), pipPos - pipTangent * (behind * 0.16f * kBlockSize) - glm::vec3(pipScale * 0.5f)) *
+              glm::scale(glm::mat4(1.0f), glm::vec3(pipScale));
+          glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(pipModel));
+          glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
+                      glowColor.x * (1.0f - behind * 0.42f),
+                      glowColor.y * (1.0f - behind * 0.42f),
+                      glowColor.z * (1.0f - behind * 0.42f));
+          glDrawArrays(GL_TRIANGLES, 0, 36);
+
+          const glm::vec3 sideGlowOffset = orbitBinormal * (std::sin((behind + blinkPhase) * glm::two_pi<float>() * 2.0f) * 0.22f * kBlockSize);
+          const glm::mat4 sideGlowModel =
+              glm::translate(glm::mat4(1.0f), pipPos + sideGlowOffset - glm::vec3(pipScale * 0.34f)) *
+              glm::scale(glm::mat4(1.0f), glm::vec3(pipScale * 0.68f));
+          glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(sideGlowModel));
+          glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
+                      glowColor.x * (0.78f - behind * 0.38f),
+                      glowColor.y * (0.78f - behind * 0.38f),
+                      glowColor.z * (0.78f - behind * 0.38f));
+          glDrawArrays(GL_TRIANGLES, 0, 36);
+        }
+      }
       glEnable(GL_CULL_FACE);
 
+      const SatelliteState& playerSatellite = playerState.satellite;
       const glm::vec3 satellitePos =
-          satellitePositionAtAngle(state.satelliteOrbitPhase, state.satelliteOrbitYaw, state.satelliteOrbitSpeed);
-      const float blinkPhase = std::sin((currentFrame / kSatelliteBlinkPeriod) * glm::two_pi<float>()) * 0.5f + 0.5f;
-      const glm::mat4 satelliteModel =
-          glm::translate(glm::mat4(1.0f), satellitePos - glm::vec3(kSatelliteSize * 0.5f)) *
-          glm::scale(glm::mat4(1.0f), glm::vec3(kSatelliteSize));
-      glBindVertexArray(solidCubeVao);
-      glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(satelliteModel));
-      glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
-                  0.82f + blinkPhase * 0.18f,
-                  0.62f + blinkPhase * 0.26f,
-                  0.16f + blinkPhase * 0.18f);
-      glDrawArrays(GL_TRIANGLES, 0, 36);
+          satellitePositionAtAngle(playerSatellite.orbitPhase, playerSatellite.orbitYaw, playerSatellite.orbitSpeed);
 
-      const glm::vec3 beaconOffset(0.22f * kBlockSize, 0.22f * kBlockSize, 0.0f);
-      const glm::mat4 beaconModel =
-          glm::translate(glm::mat4(1.0f), satellitePos + beaconOffset - glm::vec3(kSatelliteBeaconSize * 0.5f)) *
-          glm::scale(glm::mat4(1.0f), glm::vec3(kSatelliteBeaconSize * (0.75f + blinkPhase * 0.65f)));
-      glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(beaconModel));
-      glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
-                  0.96f + blinkPhase * 0.04f,
-                  0.34f + blinkPhase * 0.36f,
-                  0.18f);
-      glDisable(GL_CULL_FACE);
-      glDrawArrays(GL_TRIANGLES, 0, 36);
-      glEnable(GL_CULL_FACE);
-    }
-
-    {
-      const glm::vec3 satellitePos =
-          satellitePositionAtAngle(state.satelliteOrbitPhase, state.satelliteOrbitYaw, state.satelliteOrbitSpeed);
       const glm::vec3 center = worldCenter();
-      const glm::vec3 forward = glm::normalize(center - satellitePos);
+      const glm::vec3 satelliteForward = glm::normalize(center - satellitePos);
       glm::vec3 orbitTangent =
-          satelliteTangentAtAngle(state.satelliteOrbitPhase, state.satelliteOrbitYaw, state.satelliteOrbitSpeed);
-      orbitTangent = orbitTangent - forward * glm::dot(orbitTangent, forward);
+          satelliteTangentAtAngle(playerSatellite.orbitPhase, playerSatellite.orbitYaw, playerSatellite.orbitSpeed);
+      orbitTangent = orbitTangent - satelliteForward * glm::dot(orbitTangent, satelliteForward);
       if (glm::dot(orbitTangent, orbitTangent) < 0.0001f) {
-        orbitTangent = glm::vec3(0.0f, 0.0f, 1.0f) - forward * glm::dot(glm::vec3(0.0f, 0.0f, 1.0f), forward);
+        orbitTangent = glm::vec3(0.0f, 0.0f, 1.0f) -
+                       satelliteForward * glm::dot(glm::vec3(0.0f, 0.0f, 1.0f), satelliteForward);
       }
       const glm::vec3 miniUp = glm::normalize(orbitTangent);
 
-      const int miniSize = std::max(440, (std::min(width, height) * 2) / 5);
-      const int miniWidth = miniSize;
-      const int miniHeight = miniSize;
-      const int miniX = width - miniWidth - 20;
-      const int miniY = height - miniHeight - 20;
-      const glm::mat4 miniView = glm::lookAt(satellitePos, satellitePos + forward, miniUp);
+      const int miniSize = static_cast<int>(std::max(180.0f, (std::min(viewportWidth, viewportHeight) / 3.0f) * 1.25f));
+      const int miniX = viewportX + viewportWidth - miniSize - 18;
+      const int miniY = viewportY + viewportHeight - miniSize - 18;
+      const glm::mat4 miniView = glm::lookAt(satellitePos, satellitePos + satelliteForward, miniUp);
       const glm::mat4 miniProjection =
-          glm::perspective(glm::radians(42.0f), static_cast<float>(miniWidth) / static_cast<float>(miniHeight), 0.1f, 260.0f);
+          glm::perspective(glm::radians(42.0f), 1.0f, 0.1f, 260.0f);
 
-      glEnable(GL_SCISSOR_TEST);
-      glViewport(miniX, miniY, miniWidth, miniHeight);
-      glScissor(miniX, miniY, miniWidth, miniHeight);
+      glViewport(miniX, miniY, miniSize, miniSize);
+      glScissor(miniX, miniY, miniSize, miniSize);
       glClearColor(0.035f, 0.01f, 0.01f, 1.0f);
       glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-      const bool satelliteFueled = state.carriedFuel > 0.001f;
+      const bool satelliteFueled = playerState.carriedFuel > 0.001f;
       if (satelliteFueled) {
         drawWorld(miniView, miniProjection, satellitePos, glm::vec3(0.12f, 0.03f, 0.03f), 1.55f, 0.005f);
         drawForcefield(miniView, miniProjection, 0.28f, false);
         drawAtomicBomb(miniView, miniProjection);
+        drawPlayerBodies(playerIndex, miniView, miniProjection);
       }
 
       glUseProgram(colorProgram);
       glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uView"), 1, GL_FALSE, glm::value_ptr(identity));
       glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uProjection"), 1, GL_FALSE, glm::value_ptr(identity));
+      glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(identity));
       glBindVertexArray(orbitLineVao);
       glBindBuffer(GL_ARRAY_BUFFER, orbitLineVbo);
-      const std::array<glm::vec3, 5> miniFrame = {
-          glm::vec3(-0.96f, 0.96f, 0.0f),
-          glm::vec3(0.96f, 0.96f, 0.0f),
-          glm::vec3(0.96f, -0.96f, 0.0f),
-          glm::vec3(-0.96f, -0.96f, 0.0f),
-          glm::vec3(-0.96f, 0.96f, 0.0f),
-      };
-      glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(miniFrame), miniFrame.data());
       glDisable(GL_CULL_FACE);
       glDisable(GL_DEPTH_TEST);
       glDepthMask(GL_FALSE);
-      glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(identity));
+      const std::array<glm::vec3, 5> miniFrame = {
+          glm::vec3(-0.96f, 0.96f, 0.0f), glm::vec3(0.96f, 0.96f, 0.0f),
+          glm::vec3(0.96f, -0.96f, 0.0f), glm::vec3(-0.96f, -0.96f, 0.0f),
+          glm::vec3(-0.96f, 0.96f, 0.0f),
+      };
+      glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(miniFrame), miniFrame.data());
       glUniform3f(glGetUniformLocation(colorProgram, "uColor"), 0.72f, 0.18f, 0.12f);
       glDrawArrays(GL_LINE_STRIP, 0, static_cast<GLsizei>(miniFrame.size()));
 
-      glBindVertexArray(orbitLineVao);
-      glBindBuffer(GL_ARRAY_BUFFER, orbitLineVbo);
       std::vector<glm::vec3> fuelTextLines;
-      fuelTextLines.reserve(48);
       const auto addLine = [&](glm::vec2 a, glm::vec2 b) {
         fuelTextLines.push_back(glm::vec3(a, 0.0f));
         fuelTextLines.push_back(glm::vec3(b, 0.0f));
       };
       const auto addDigit = [&](int digit, float x, float y, float w, float h) {
-        const glm::vec2 topL(x, y);
-        const glm::vec2 topR(x + w, y);
-        const glm::vec2 midL(x, y - h * 0.5f);
-        const glm::vec2 midR(x + w, y - h * 0.5f);
-        const glm::vec2 botL(x, y - h);
-        const glm::vec2 botR(x + w, y - h);
+        const glm::vec2 topL(x, y), topR(x + w, y), midL(x, y - h * 0.5f), midR(x + w, y - h * 0.5f),
+            botL(x, y - h), botR(x + w, y - h);
         const bool seg[10][7] = {
-            {true, true, true, false, true, true, true},     // 0
-            {false, false, true, false, false, true, false}, // 1
-            {true, false, true, true, true, false, true},    // 2
-            {true, false, true, true, false, true, true},    // 3
-            {false, true, true, true, false, true, false},   // 4
-            {true, true, false, true, false, true, true},    // 5
-            {true, true, false, true, true, true, true},     // 6
-            {true, false, true, false, false, true, false},  // 7
-            {true, true, true, true, true, true, true},      // 8
-            {true, true, true, true, false, true, true},     // 9
+            {true, true, true, false, true, true, true}, {false, false, true, false, false, true, false},
+            {true, false, true, true, true, false, true}, {true, false, true, true, false, true, true},
+            {false, true, true, true, false, true, false}, {true, true, false, true, false, true, true},
+            {true, true, false, true, true, true, true}, {true, false, true, false, false, true, false},
+            {true, true, true, true, true, true, true}, {true, true, true, true, false, true, true},
         };
         if (seg[digit][0]) addLine(topL, topR);
         if (seg[digit][1]) addLine(topL, midL);
@@ -2524,40 +3003,130 @@ int main() {
         }
       };
 
-      const int shownFuel = static_cast<int>(std::ceil(state.carriedFuel));
-      const int shownMaxFuel = static_cast<int>(kFuelCarryMax);
       float cursor = -0.80f;
       const float textY = 0.84f;
       const float digitW = 0.11f;
       const float digitH = 0.16f;
       const float spacing = 0.035f;
-      addNumber(shownFuel, cursor, textY, digitW, digitH, spacing);
+      addNumber(static_cast<int>(std::ceil(playerState.carriedFuel)), cursor, textY, digitW, digitH, spacing);
       addSlash(cursor + 0.01f, textY, 0.07f, digitH);
       cursor += 0.11f;
-      addNumber(shownMaxFuel, cursor, textY, digitW, digitH, spacing);
-      const std::string plutoniumText = std::to_string(state.carriedPlutonium);
+      addNumber(static_cast<int>(kFuelCarryMax), cursor, textY, digitW, digitH, spacing);
+      const std::string plutoniumText = std::to_string(playerState.carriedPlutonium);
       const float plutoniumDigitW = digitW * 0.9f;
       const float plutoniumDigitH = digitH * 0.9f;
       const float plutoniumSpacing = spacing * 0.9f;
-      const float plutoniumY = 0.84f;
       const float plutoniumWidth =
           static_cast<float>(plutoniumText.size()) * plutoniumDigitW +
           static_cast<float>(std::max(0, static_cast<int>(plutoniumText.size()) - 1)) * plutoniumSpacing;
       float plutoniumCursor = 0.80f - plutoniumWidth;
-      addNumber(state.carriedPlutonium, plutoniumCursor, plutoniumY, plutoniumDigitW, plutoniumDigitH, plutoniumSpacing);
-
+      addNumber(playerState.carriedPlutonium, plutoniumCursor, textY, plutoniumDigitW, plutoniumDigitH, plutoniumSpacing);
       if (!fuelTextLines.empty()) {
         glBufferSubData(GL_ARRAY_BUFFER, 0,
                         static_cast<GLsizeiptr>(fuelTextLines.size() * sizeof(glm::vec3)),
                         fuelTextLines.data());
-        glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(identity));
         glUniform3f(glGetUniformLocation(colorProgram, "uColor"), 0.90f, 0.72f, 0.22f);
         glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(fuelTextLines.size()));
       }
 
+      if (satelliteFueled) {
+        if (const auto bombsite = predictBombsiteImpact(state.world, playerState.satellite)) {
+          const glm::vec4 clip = miniProjection * miniView * glm::vec4(bombsite->impactPos, 1.0f);
+          if (std::abs(clip.w) > 0.0001f) {
+            const glm::vec3 ndc = glm::vec3(clip) / clip.w;
+            if (ndc.z >= -1.0f && ndc.z <= 1.0f && ndc.x >= -1.15f && ndc.x <= 1.15f && ndc.y >= -1.15f && ndc.y <= 1.15f) {
+              const glm::vec3 baseReticleColor = bombsite->hitForcefield
+                                                     ? glm::vec3(0.36f, 1.0f, 0.42f)
+                                                     : (playerIndex == 0 ? glm::vec3(1.0f, 0.78f, 0.20f)
+                                                                         : glm::vec3(0.62f, 0.92f, 1.0f));
+
+              std::vector<glm::vec3> reticleLines;
+              reticleLines.reserve(96);
+              const auto addReticleSegment = [&](glm::vec2 a, glm::vec2 b) {
+                reticleLines.push_back(glm::vec3(a, 0.0f));
+                reticleLines.push_back(glm::vec3(b, 0.0f));
+              };
+
+              const glm::vec2 center2D(ndc.x, ndc.y);
+              const float ringRadius = 0.072f;
+              const float tickOuter = 0.122f;
+              const float tickInner = 0.090f;
+              const float crossOuter = 0.050f;
+              const float crossGap = 0.015f;
+              const int ringSegments = 28;
+
+              for (int i = 0; i < ringSegments; ++i) {
+                const float a0 = (static_cast<float>(i) / static_cast<float>(ringSegments)) * glm::two_pi<float>();
+                const float a1 = (static_cast<float>(i + 1) / static_cast<float>(ringSegments)) * glm::two_pi<float>();
+                addReticleSegment(center2D + glm::vec2(std::cos(a0), std::sin(a0)) * ringRadius,
+                                  center2D + glm::vec2(std::cos(a1), std::sin(a1)) * ringRadius);
+              }
+
+              addReticleSegment(center2D + glm::vec2(-tickOuter, 0.0f), center2D + glm::vec2(-tickInner, 0.0f));
+              addReticleSegment(center2D + glm::vec2(tickInner, 0.0f), center2D + glm::vec2(tickOuter, 0.0f));
+              addReticleSegment(center2D + glm::vec2(0.0f, -tickOuter), center2D + glm::vec2(0.0f, -tickInner));
+              addReticleSegment(center2D + glm::vec2(0.0f, tickInner), center2D + glm::vec2(0.0f, tickOuter));
+              addReticleSegment(center2D + glm::vec2(-crossOuter, 0.0f), center2D + glm::vec2(-crossGap, 0.0f));
+              addReticleSegment(center2D + glm::vec2(crossGap, 0.0f), center2D + glm::vec2(crossOuter, 0.0f));
+              addReticleSegment(center2D + glm::vec2(0.0f, -crossOuter), center2D + glm::vec2(0.0f, -crossGap));
+              addReticleSegment(center2D + glm::vec2(0.0f, crossGap), center2D + glm::vec2(0.0f, crossOuter));
+
+              constexpr int kDriftSamples = 7;
+              glm::vec2 lastDriftPoint = center2D;
+              bool hasLastDriftPoint = false;
+              for (int sample = kDriftSamples; sample >= 1; --sample) {
+                SatelliteState priorSatellite = playerState.satellite;
+                priorSatellite.orbitPhase -= playerState.satellite.orbitSpeed * 0.14f * static_cast<float>(sample);
+                const auto priorPrediction = predictBombsiteImpact(state.world, priorSatellite);
+                if (!priorPrediction.has_value()) {
+                  continue;
+                }
+
+                const glm::vec4 priorClip = miniProjection * miniView * glm::vec4(priorPrediction->impactPos, 1.0f);
+                if (std::abs(priorClip.w) <= 0.0001f) {
+                  continue;
+                }
+
+                const glm::vec3 priorNdc = glm::vec3(priorClip) / priorClip.w;
+                if (priorNdc.z < -1.0f || priorNdc.z > 1.0f || priorNdc.x < -1.2f || priorNdc.x > 1.2f ||
+                    priorNdc.y < -1.2f || priorNdc.y > 1.2f) {
+                  continue;
+                }
+
+                const glm::vec2 driftPoint(priorNdc.x, priorNdc.y);
+                if (hasLastDriftPoint) {
+                  addReticleSegment(lastDriftPoint, driftPoint);
+                }
+                lastDriftPoint = driftPoint;
+                hasLastDriftPoint = true;
+              }
+
+              if (!reticleLines.empty()) {
+                glBufferSubData(GL_ARRAY_BUFFER, 0,
+                                static_cast<GLsizeiptr>(reticleLines.size() * sizeof(glm::vec3)),
+                                reticleLines.data());
+                glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
+                            baseReticleColor.x, baseReticleColor.y, baseReticleColor.z);
+                glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(reticleLines.size()));
+              }
+
+              const std::array<glm::vec3, 4> centerDot = {
+                  glm::vec3(center2D.x - 0.010f, center2D.y, 0.0f),
+                  glm::vec3(center2D.x + 0.010f, center2D.y, 0.0f),
+                  glm::vec3(center2D.x, center2D.y - 0.010f, 0.0f),
+                  glm::vec3(center2D.x, center2D.y + 0.010f, 0.0f),
+              };
+              glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(centerDot), centerDot.data());
+              glUniform3f(glGetUniformLocation(colorProgram, "uColor"), 1.0f, 0.96f, 0.90f);
+              glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(centerDot.size()));
+            }
+          }
+        }
+      }
+
       if (!satelliteFueled) {
         std::array<glm::vec3, kSatelliteNoiseSegments * 2> noiseLines{};
-        const int noiseTime = static_cast<int>(currentFrame * 28.0f);
+        const int noiseTime = static_cast<int>(currentFrame * 28.0f) + playerIndex * 97;
         for (int i = 0; i < kSatelliteNoiseSegments; ++i) {
           const float x0 = hashNoise(noiseTime * 19 + i * 37, noiseTime * 7 + i * 13) * 1.92f - 0.96f;
           const float y0 = hashNoise(noiseTime * 11 + i * 17, noiseTime * 23 + i * 29) * 1.92f - 0.96f;
@@ -2567,7 +3136,9 @@ int main() {
           noiseLines[static_cast<std::size_t>(i * 2 + 1)] = glm::vec3(x0 + dx, y0 + dy, 0.0f);
         }
         glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(noiseLines), noiseLines.data());
-        glUniform3f(glGetUniformLocation(colorProgram, "uColor"), 0.42f, 0.86f, 0.78f);
+        const glm::vec3 staticColor =
+            playerIndex == 0 ? glm::vec3(0.96f, 0.56f, 0.24f) : glm::vec3(0.58f, 0.88f, 1.0f);
+        glUniform3f(glGetUniformLocation(colorProgram, "uColor"), staticColor.x, staticColor.y, staticColor.z);
         glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(noiseLines.size()));
 
         std::array<glm::vec3, 16> tearLines{};
@@ -2581,147 +3152,62 @@ int main() {
         glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(tearLines.size()));
       }
 
-      if (satelliteFueled) {
-        if (const auto bombsite = predictBombsiteImpact(
-                state.world, state.satelliteOrbitPhase, state.satelliteOrbitYaw, state.satelliteOrbitSpeed)) {
-        const glm::vec4 clip = miniProjection * miniView * glm::vec4(bombsite->impactPos, 1.0f);
-        if (clip.w > 0.0001f) {
-          const glm::vec3 ndc = glm::vec3(clip) / clip.w;
-          if (std::abs(ndc.x) <= 1.1f && std::abs(ndc.y) <= 1.1f) {
-            const glm::vec3 reticleColor = bombsite->hitForcefield
-                                               ? glm::vec3(0.26f, 1.0f, 0.32f)
-                                               : glm::vec3(1.0f, 0.86f, 0.22f);
+      glViewport(viewportX, viewportY, viewportWidth, viewportHeight);
+      glScissor(viewportX, viewportY, viewportWidth, viewportHeight);
 
-            const float sight = 0.060f;
-            const float gap = 0.020f;
-            const std::array<glm::vec3, 8> sightLines = {
-                glm::vec3(ndc.x - sight, ndc.y, 0.0f), glm::vec3(ndc.x - gap, ndc.y, 0.0f),
-                glm::vec3(ndc.x + gap, ndc.y, 0.0f), glm::vec3(ndc.x + sight, ndc.y, 0.0f),
-                glm::vec3(ndc.x, ndc.y - sight, 0.0f), glm::vec3(ndc.x, ndc.y - gap, 0.0f),
-                glm::vec3(ndc.x, ndc.y + gap, 0.0f), glm::vec3(ndc.x, ndc.y + sight, 0.0f),
-            };
-            glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(sightLines), sightLines.data());
-            glUniform3f(glGetUniformLocation(colorProgram, "uColor"), reticleColor.r, reticleColor.g, reticleColor.b);
-            glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(sightLines.size()));
-
-            constexpr int kReticleRingSegments = 24;
-            std::array<glm::vec3, kReticleRingSegments + 1> ring{};
-            const float ringRadius = 0.050f;
-            for (int i = 0; i <= kReticleRingSegments; ++i) {
-              const float a = (static_cast<float>(i) / static_cast<float>(kReticleRingSegments)) *
-                              glm::two_pi<float>();
-              ring[static_cast<std::size_t>(i)] =
-                  glm::vec3(ndc.x + std::cos(a) * ringRadius, ndc.y + std::sin(a) * ringRadius, 0.0f);
-            }
-            glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(ring), ring.data());
-            glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
-                        reticleColor.r * 0.88f, reticleColor.g * 0.88f, reticleColor.b * 0.88f);
-            glDrawArrays(GL_LINE_STRIP, 0, static_cast<GLsizei>(ring.size()));
-
-            std::array<glm::vec3, 6> driftTrail{};
-            int driftCount = 0;
-            for (int sample = 5; sample >= 0; --sample) {
-              const float dt = 0.12f * static_cast<float>(sample);
-              const float pastPhase =
-                  state.satelliteOrbitPhase -
-                  glm::two_pi<float>() * (state.satelliteOrbitSpeed / kSatelliteOrbitPeriod) * dt;
-              const auto pastBombsite = predictBombsiteImpact(
-                  state.world, pastPhase, state.satelliteOrbitYaw, state.satelliteOrbitSpeed);
-              if (!pastBombsite.has_value()) {
-                continue;
-              }
-              const glm::vec4 pastClip = miniProjection * miniView * glm::vec4(pastBombsite->impactPos, 1.0f);
-              if (pastClip.w <= 0.0001f) {
-                continue;
-              }
-              const glm::vec3 pastNdc = glm::vec3(pastClip) / pastClip.w;
-              if (std::abs(pastNdc.x) > 1.2f || std::abs(pastNdc.y) > 1.2f) {
-                continue;
-              }
-              driftTrail[static_cast<std::size_t>(driftCount++)] = glm::vec3(pastNdc.x, pastNdc.y, 0.0f);
-            }
-            if (driftCount >= 2) {
-              glBufferSubData(GL_ARRAY_BUFFER, 0, static_cast<GLsizeiptr>(sizeof(glm::vec3) * driftCount),
-                              driftTrail.data());
-              glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
-                          reticleColor.r * 0.52f, reticleColor.g * 0.52f, reticleColor.b * 0.52f);
-              glDrawArrays(GL_LINE_STRIP, 0, driftCount);
-            }
-
-            const std::array<glm::vec3, 4> centerTick = {
-                glm::vec3(ndc.x - 0.010f, ndc.y, 0.0f),
-                glm::vec3(ndc.x + 0.010f, ndc.y, 0.0f),
-                glm::vec3(ndc.x, ndc.y - 0.010f, 0.0f),
-                glm::vec3(ndc.x, ndc.y + 0.010f, 0.0f),
-            };
-            glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(centerTick), centerTick.data());
-            glUniform3f(glGetUniformLocation(colorProgram, "uColor"), reticleColor.r, reticleColor.g, reticleColor.b);
-            glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(centerTick.size()));
-          }
-        }
-      }
-      }
-
-      glDepthMask(GL_TRUE);
-      glEnable(GL_DEPTH_TEST);
-      glEnable(GL_CULL_FACE);
-      glViewport(0, 0, width, height);
-      glDisable(GL_SCISSOR_TEST);
-    }
-
-    if (state.hoveredBlock.has_value()) {
-      const glm::vec3 blockPos = blockToWorld(state.hoveredBlock->block) - glm::vec3(0.001f);
-      const glm::mat4 outlineModel = glm::translate(glm::mat4(1.0f), blockPos);
-      glUseProgram(outlineProgram);
-      glUniformMatrix4fv(glGetUniformLocation(outlineProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(outlineModel));
-      glUniformMatrix4fv(glGetUniformLocation(outlineProgram, "uView"), 1, GL_FALSE, glm::value_ptr(view));
-      glUniformMatrix4fv(glGetUniformLocation(outlineProgram, "uProjection"), 1, GL_FALSE, glm::value_ptr(projection));
-      glm::vec3 outlineColor(1.0f, 0.92f, 0.72f);
-      if (state.mining.active && sameBlock(state.mining.block, state.hoveredBlock->block)) {
-        const float progress = std::clamp(state.mining.progress / miningDurationFor(state.mining.type), 0.0f, 1.0f);
-        outlineColor = glm::mix(glm::vec3(0.96f, 0.72f, 0.24f), glm::vec3(1.0f, 0.25f, 0.10f), progress);
-      }
-      glUniform3f(glGetUniformLocation(outlineProgram, "uColor"), outlineColor.x, outlineColor.y, outlineColor.z);
-
-      glDisable(GL_CULL_FACE);
-      glDepthMask(GL_FALSE);
-      glBindVertexArray(outlineVao);
-      glDrawArrays(GL_LINES, 0, 24);
-      glDepthMask(GL_TRUE);
-      glEnable(GL_CULL_FACE);
-
-      const glm::ivec3 place = state.hoveredBlock->previous;
-      const bool canPlace =
-          state.world.inBounds(place.x, place.y, place.z) &&
-          state.world.get(place.x, place.y, place.z) == Air &&
-          !playerIntersectsBlock(state.player.position, place);
-      if (canPlace) {
-        const glm::vec3 placePos = blockToWorld(place) - glm::vec3(0.001f);
-        const glm::mat4 placeModel = glm::translate(glm::mat4(1.0f), placePos);
-        glUniformMatrix4fv(glGetUniformLocation(outlineProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(placeModel));
-
-        glm::vec3 placeColor(0.58f, 0.90f, 1.00f);
-        if (state.selectedBlock == Ember) {
-          placeColor = glm::vec3(1.00f, 0.48f, 0.20f);
-        } else if (state.selectedBlock == DarkRock) {
-          placeColor = glm::vec3(0.74f, 0.72f, 0.88f);
-        } else if (state.selectedBlock == Crust) {
-          placeColor = glm::vec3(0.96f, 0.78f, 0.44f);
-        }
-        if (state.placing.active && sameBlock(state.placing.block, place) && state.placing.type == state.selectedBlock) {
+      if (playerState.hoveredBlock.has_value()) {
+        const glm::vec3 blockPos = blockToWorld(playerState.hoveredBlock->block) - glm::vec3(0.001f);
+        const glm::mat4 outlineModel = glm::translate(glm::mat4(1.0f), blockPos);
+        glUseProgram(outlineProgram);
+        glUniformMatrix4fv(glGetUniformLocation(outlineProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(outlineModel));
+        glUniformMatrix4fv(glGetUniformLocation(outlineProgram, "uView"), 1, GL_FALSE, glm::value_ptr(view));
+        glUniformMatrix4fv(glGetUniformLocation(outlineProgram, "uProjection"), 1, GL_FALSE, glm::value_ptr(projection));
+        glm::vec3 outlineColor(1.0f, 0.92f, 0.72f);
+        if (playerState.mining.active && sameBlock(playerState.mining.block, playerState.hoveredBlock->block)) {
           const float progress =
-              std::clamp(state.placing.progress / placementDurationFor(state.placing.type), 0.0f, 1.0f);
-          placeColor = glm::mix(placeColor * 0.72f, glm::vec3(1.0f, 0.96f, 0.82f), progress);
+              std::clamp(playerState.mining.progress / miningDurationFor(playerState.mining.type), 0.0f, 1.0f);
+          outlineColor = glm::mix(glm::vec3(0.96f, 0.72f, 0.24f), glm::vec3(1.0f, 0.25f, 0.10f), progress);
         }
-        glUniform3f(glGetUniformLocation(outlineProgram, "uColor"), placeColor.x, placeColor.y, placeColor.z);
+        glUniform3f(glGetUniformLocation(outlineProgram, "uColor"), outlineColor.x, outlineColor.y, outlineColor.z);
+        glDisable(GL_CULL_FACE);
         glDepthMask(GL_FALSE);
         glBindVertexArray(outlineVao);
         glDrawArrays(GL_LINES, 0, 24);
         glDepthMask(GL_TRUE);
-      }
-    }
+        glEnable(GL_CULL_FACE);
 
-    {
+        const glm::ivec3 place = playerState.hoveredBlock->previous;
+        bool canPlace = state.world.inBounds(place.x, place.y, place.z) && state.world.get(place.x, place.y, place.z) == Air;
+        if (canPlace) {
+          for (const PlayerState& otherPlayer : state.players) {
+            if (playerIntersectsBlock(otherPlayer, otherPlayer.avatar.position, place)) {
+              canPlace = false;
+              break;
+            }
+          }
+        }
+        if (canPlace) {
+          const glm::vec3 placePos = blockToWorld(place) - glm::vec3(0.001f);
+          const glm::mat4 placeModel = glm::translate(glm::mat4(1.0f), placePos);
+          glUniformMatrix4fv(glGetUniformLocation(outlineProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(placeModel));
+          glm::vec3 placeColor(0.58f, 0.90f, 1.00f);
+          if (playerState.selectedBlock == Ember) placeColor = glm::vec3(1.00f, 0.48f, 0.20f);
+          else if (playerState.selectedBlock == DarkRock) placeColor = glm::vec3(0.74f, 0.72f, 0.88f);
+          else if (playerState.selectedBlock == Crust) placeColor = glm::vec3(0.96f, 0.78f, 0.44f);
+          if (playerState.placing.active && sameBlock(playerState.placing.block, place) &&
+              playerState.placing.type == playerState.selectedBlock) {
+            const float progress =
+                std::clamp(playerState.placing.progress / placementDurationFor(playerState.placing.type), 0.0f, 1.0f);
+            placeColor = glm::mix(placeColor * 0.72f, glm::vec3(1.0f, 0.96f, 0.82f), progress);
+          }
+          glUniform3f(glGetUniformLocation(outlineProgram, "uColor"), placeColor.x, placeColor.y, placeColor.z);
+          glDepthMask(GL_FALSE);
+          glBindVertexArray(outlineVao);
+          glDrawArrays(GL_LINES, 0, 24);
+          glDepthMask(GL_TRUE);
+        }
+      }
+
       glUseProgram(colorProgram);
       glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uView"), 1, GL_FALSE, glm::value_ptr(identity));
       glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uProjection"), 1, GL_FALSE, glm::value_ptr(identity));
@@ -2732,8 +3218,9 @@ int main() {
       glDepthMask(GL_FALSE);
       glDisable(GL_CULL_FACE);
 
-      const bool targetLocked = state.hoveredBlock.has_value();
-      const glm::vec3 crosshairColor = targetLocked ? glm::vec3(1.0f, 0.92f, 0.74f) : glm::vec3(0.78f, 0.62f, 0.52f);
+      const bool targetLocked = playerState.hoveredBlock.has_value();
+      const glm::vec3 crosshairColor =
+          targetLocked ? glm::vec3(1.0f, 0.92f, 0.74f) : glm::vec3(0.78f, 0.62f, 0.52f);
       const float arm = targetLocked ? 0.020f : 0.016f;
       const float gap = targetLocked ? 0.005f : 0.007f;
       const std::array<glm::vec3, 12> crosshair = {
@@ -2749,42 +3236,20 @@ int main() {
       glDrawArrays(GL_LINES, 0, 8);
       glDrawArrays(GL_LINE_LOOP, 8, 4);
 
-      if (targetLocked) {
-        const std::array<glm::vec3, 8> brackets = {
-            glm::vec3(-0.030f, -0.030f, 0.0f), glm::vec3(-0.018f, -0.030f, 0.0f),
-            glm::vec3(-0.030f, -0.030f, 0.0f), glm::vec3(-0.030f, -0.018f, 0.0f),
-            glm::vec3(0.030f, 0.030f, 0.0f), glm::vec3(0.018f, 0.030f, 0.0f),
-            glm::vec3(0.030f, 0.030f, 0.0f), glm::vec3(0.030f, 0.018f, 0.0f),
-        };
-        glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(brackets), brackets.data());
-        glUniform3f(glGetUniformLocation(colorProgram, "uColor"), 1.0f, 0.70f, 0.32f);
-        glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(brackets.size()));
-      }
-
       std::vector<glm::vec3> healthTextLines;
-      healthTextLines.reserve(48);
       const auto addHudLine = [&](glm::vec2 a, glm::vec2 b) {
         healthTextLines.push_back(glm::vec3(a, 0.0f));
         healthTextLines.push_back(glm::vec3(b, 0.0f));
       };
       const auto addHudDigit = [&](int digit, float x, float y, float w, float h) {
-        const glm::vec2 topL(x, y);
-        const glm::vec2 topR(x + w, y);
-        const glm::vec2 midL(x, y - h * 0.5f);
-        const glm::vec2 midR(x + w, y - h * 0.5f);
-        const glm::vec2 botL(x, y - h);
-        const glm::vec2 botR(x + w, y - h);
+        const glm::vec2 topL(x, y), topR(x + w, y), midL(x, y - h * 0.5f), midR(x + w, y - h * 0.5f),
+            botL(x, y - h), botR(x + w, y - h);
         const bool seg[10][7] = {
-            {true, true, true, false, true, true, true},
-            {false, false, true, false, false, true, false},
-            {true, false, true, true, true, false, true},
-            {true, false, true, true, false, true, true},
-            {false, true, true, true, false, true, false},
-            {true, true, false, true, false, true, true},
-            {true, true, false, true, true, true, true},
-            {true, false, true, false, false, true, false},
-            {true, true, true, true, true, true, true},
-            {true, true, true, true, false, true, true},
+            {true, true, true, false, true, true, true}, {false, false, true, false, false, true, false},
+            {true, false, true, true, true, false, true}, {true, false, true, true, false, true, true},
+            {false, true, true, true, false, true, false}, {true, true, false, true, false, true, true},
+            {true, true, false, true, true, true, true}, {true, false, true, false, false, true, false},
+            {true, true, true, true, true, true, true}, {true, true, true, true, false, true, true},
         };
         if (seg[digit][0]) addHudLine(topL, topR);
         if (seg[digit][1]) addHudLine(topL, midL);
@@ -2804,22 +3269,22 @@ int main() {
           cursor += w + spacing;
         }
       };
-
-      const int shownHealth = static_cast<int>(std::ceil(state.playerHealth));
       float healthCursor = -0.92f;
       const float healthY = 0.90f;
       const float healthDigitW = 0.080f;
       const float healthDigitH = 0.120f;
       const float healthSpacing = 0.026f;
-      addHudNumber(shownHealth, healthCursor, healthY, healthDigitW, healthDigitH, healthSpacing);
+      addHudNumber(static_cast<int>(std::ceil(playerState.health)), healthCursor, healthY, healthDigitW, healthDigitH,
+                   healthSpacing);
       addHudSlash(healthCursor + 0.008f, healthY, 0.055f, healthDigitH);
       healthCursor += 0.09f;
-      addHudNumber(static_cast<int>(kPlayerMaxHealth), healthCursor, healthY, healthDigitW, healthDigitH, healthSpacing);
+      addHudNumber(static_cast<int>(kPlayerMaxHealth), healthCursor, healthY, healthDigitW, healthDigitH,
+                   healthSpacing);
       if (!healthTextLines.empty()) {
-        const float healthRatio = std::clamp(state.playerHealth / kPlayerMaxHealth, 0.0f, 1.0f);
+        const float healthRatio = std::clamp(playerState.health / kPlayerMaxHealth, 0.0f, 1.0f);
         glm::vec3 healthColor =
             glm::mix(glm::vec3(1.0f, 0.28f, 0.18f), glm::vec3(1.0f, 0.88f, 0.72f), healthRatio);
-        healthColor = glm::mix(healthColor, glm::vec3(1.0f, 1.0f, 1.0f), state.playerDamageFlash * 0.65f);
+        healthColor = glm::mix(healthColor, glm::vec3(1.0f, 1.0f, 1.0f), playerState.damageFlash * 0.65f);
         glBufferSubData(GL_ARRAY_BUFFER, 0,
                         static_cast<GLsizeiptr>(healthTextLines.size() * sizeof(glm::vec3)),
                         healthTextLines.data());
@@ -2827,19 +3292,63 @@ int main() {
         glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(healthTextLines.size()));
       }
 
+      std::vector<glm::vec3> scoreLines;
+      scoreLines.reserve(48);
+      const auto addScoreLine = [&](glm::vec2 a, glm::vec2 b) {
+        scoreLines.push_back(glm::vec3(a, 0.0f));
+        scoreLines.push_back(glm::vec3(b, 0.0f));
+      };
+      const auto addScoreDigit = [&](int digit, float x, float y, float w, float h) {
+        const glm::vec2 topL(x, y), topR(x + w, y), midL(x, y - h * 0.5f), midR(x + w, y - h * 0.5f),
+            botL(x, y - h), botR(x + w, y - h);
+        const bool seg[10][7] = {
+            {true, true, true, false, true, true, true}, {false, false, true, false, false, true, false},
+            {true, false, true, true, true, false, true}, {true, false, true, true, false, true, true},
+            {false, true, true, true, false, true, false}, {true, true, false, true, false, true, true},
+            {true, true, false, true, true, true, true}, {true, false, true, false, false, true, false},
+            {true, true, true, true, true, true, true}, {true, true, true, true, false, true, true},
+        };
+        if (seg[digit][0]) addScoreLine(topL, topR);
+        if (seg[digit][1]) addScoreLine(topL, midL);
+        if (seg[digit][2]) addScoreLine(topR, midR);
+        if (seg[digit][3]) addScoreLine(midL, midR);
+        if (seg[digit][4]) addScoreLine(midL, botL);
+        if (seg[digit][5]) addScoreLine(midR, botR);
+        if (seg[digit][6]) addScoreLine(botL, botR);
+      };
+      const auto addScoreNumber = [&](int value, float& cursor, float y, float w, float h, float spacing) {
+        const std::string text = std::to_string(value);
+        for (char ch : text) {
+          addScoreDigit(ch - '0', cursor, y, w, h);
+          cursor += w + spacing;
+        }
+      };
+
+      float scoreCursor = -0.92f;
+      const float scoreY = -0.74f;
+      const float scoreDigitW = 0.065f;
+      const float scoreDigitH = 0.10f;
+      const float scoreSpacing = 0.022f;
+      addScoreNumber(state.scores[0], scoreCursor, scoreY, scoreDigitW, scoreDigitH, scoreSpacing);
+      scoreCursor += 0.05f;
+      addScoreNumber(state.scores[1], scoreCursor, scoreY, scoreDigitW, scoreDigitH, scoreSpacing);
+      if (!scoreLines.empty()) {
+        glBufferSubData(GL_ARRAY_BUFFER, 0,
+                        static_cast<GLsizeiptr>(scoreLines.size() * sizeof(glm::vec3)),
+                        scoreLines.data());
+        glUniform3f(glGetUniformLocation(colorProgram, "uColor"), 1.0f, 0.92f, 0.64f);
+        glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(scoreLines.size()));
+      }
+
       glEnable(GL_CULL_FACE);
       glDepthMask(GL_TRUE);
       glEnable(GL_DEPTH_TEST);
-    }
 
-    {
-      const float swingT = state.hand.swinging ? (state.hand.swingTime / kHandSwingDuration) : 0.0f;
+      const float swingT = playerState.hand.swinging ? (playerState.hand.swingTime / kHandSwingDuration) : 0.0f;
       const float swingArc = std::sin(swingT * 3.14159265f);
       const float swingDrop = std::sin(swingT * 6.2831853f) * 0.08f;
-
       const glm::mat4 handProjection = glm::perspective(glm::radians(65.0f), aspect, 0.01f, 10.0f);
       const glm::mat4 handView(1.0f);
-
       glm::mat4 handModel(1.0f);
       handModel = glm::translate(handModel, glm::vec3(0.56f + swingArc * 0.06f, -0.86f - swingDrop * 0.7f, -0.92f));
       handModel = glm::rotate(handModel, glm::radians(10.0f + swingArc * 16.0f), glm::vec3(0.0f, 0.0f, 1.0f));
@@ -2860,22 +3369,24 @@ int main() {
       toolModel = glm::rotate(toolModel, glm::radians(-18.0f - swingArc * 30.0f), glm::vec3(1.0f, 0.0f, 0.0f));
       toolModel = glm::scale(toolModel, glm::vec3(0.22f, 0.9f, 0.22f));
       glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(toolModel));
-      if (state.selectedBlock == Ember) {
-        glUniform3f(glGetUniformLocation(colorProgram, "uColor"), 0.82f, 0.28f, 0.14f);
-      } else if (state.selectedBlock == DarkRock) {
-        glUniform3f(glGetUniformLocation(colorProgram, "uColor"), 0.28f, 0.16f, 0.14f);
-      } else {
-        glUniform3f(glGetUniformLocation(colorProgram, "uColor"), 0.56f, 0.22f, 0.12f);
-      }
+      if (playerState.selectedBlock == Ember) glUniform3f(glGetUniformLocation(colorProgram, "uColor"), 0.82f, 0.28f, 0.14f);
+      else if (playerState.selectedBlock == DarkRock) glUniform3f(glGetUniformLocation(colorProgram, "uColor"), 0.28f, 0.16f, 0.14f);
+      else glUniform3f(glGetUniformLocation(colorProgram, "uColor"), 0.56f, 0.22f, 0.12f);
       glDrawArrays(GL_TRIANGLES, 0, 36);
 
       glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(handModel));
       glUniform3f(glGetUniformLocation(colorProgram, "uColor"), 0.86f, 0.68f, 0.56f);
       glDrawArrays(GL_TRIANGLES, 0, 36);
+
       glEnable(GL_CULL_FACE);
       glDepthMask(GL_TRUE);
       glEnable(GL_DEPTH_TEST);
-    }
+      glDisable(GL_SCISSOR_TEST);
+    };
+
+    const int halfWidth = width / 2;
+    renderPlayerViewport(0, 0, 0, halfWidth, height);
+    renderPlayerViewport(1, halfWidth, 0, width - halfWidth, height);
 
     glfwSwapBuffers(window);
     glfwPollEvents();
@@ -2897,6 +3408,10 @@ int main() {
   glDeleteProgram(outlineProgram);
   glDeleteProgram(skyProgram);
   glDeleteProgram(worldProgram);
+  if (gHiddenCursor) {
+    glfwDestroyCursor(gHiddenCursor);
+    gHiddenCursor = nullptr;
+  }
   glfwDestroyWindow(window);
   glfwTerminate();
   return 0;

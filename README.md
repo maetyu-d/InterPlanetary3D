@@ -14,6 +14,7 @@ Small C++ voxel prototype using OpenGL, GLFW, and GLAD.
 - Collectible fuel blocks that keep the satellite feed alive
 - Toxic-yellow plutonium blocks used to arm atomic bombs
 - Player health with hazard and blast damage
+- Vertical split-screen local two-player mode
 
 ## Build
 
@@ -42,6 +43,18 @@ cd /Users/user/Documents/MineyCraft
 - `Hold Right Click`: place block
 - `1 / 2 / 3`: switch block type
 - `Esc`: release mouse
+
+Player 2 uses a control pad on the right screen:
+- `Left stick`: move
+- `Right stick`: look
+- `A`: jump
+- `Left stick press`: sprint
+- `B`: drop an atomic bomb from player 2's satellite
+- `Left trigger`: place block
+- `Right trigger`: dig block
+- `Left / right bumper`: rotate player 2's satellite orbit
+- `X / Y`: slow down or speed up player 2's satellite
+- `D-pad left / up / right`: switch block type
 
 Break glowing cyan fuel blocks to refill the satellite feed. Break toxic-yellow plutonium blocks to stockpile bomb material. Each atomic bomb costs `2` plutonium. When fuel runs out, the satellite camera collapses into static.
 Nearby atomic blasts hurt, and touching the forcefield is instantly fatal.
