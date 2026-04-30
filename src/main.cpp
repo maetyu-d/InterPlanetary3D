@@ -43,6 +43,12 @@ constexpr float kStep = 0.05f * kBlockSize;
 constexpr float kCollisionInset = 0.001f;
 constexpr float kForcefieldThickness = 0.10f * kBlockSize;
 constexpr float kForcefieldOversize = 1.155f;
+constexpr float kFuelPickupAmount = 1.0f;
+constexpr float kFuelDrainPerSecond = 0.05f;
+constexpr float kFuelCarryMax = 12.0f;
+constexpr float kFuelStartingCarry = 4.0f;
+constexpr int kPlutoniumPerPickup = 1;
+constexpr int kPlutoniumPerAtomicBomb = 2;
 constexpr float kBombDropGravity = 17.0f * kBlockSize;
 constexpr float kBombDropStep = 0.03f;
 constexpr float kBombDropMaxTime = 12.0f;
@@ -68,6 +74,8 @@ constexpr float kAtomicBombBounceHeight = 1.15f * kBlockSize;
 constexpr float kAtomicBombBounceDrift = 2.4f * kBlockSize;
 constexpr int kAtomicBombTrailCapacity = 14;
 constexpr int kAtomicBombRingSegments = 40;
+constexpr int kDynamicLineCapacity = 256;
+constexpr int kSatelliteNoiseSegments = 84;
 constexpr float kMissileSize = 0.45f * kBlockSize;
 constexpr float kMissileOrbitPadding = 7.0f * kBlockSize;
 constexpr float kMissileLaunchLift = 2.4f * kBlockSize;
@@ -94,6 +102,8 @@ enum BlockType : std::uint8_t {
   DarkRock = 2,
   Ember = 3,
   Target = 4,
+  Fuel = 5,
+  Plutonium = 6,
 };
 
 struct Vertex {
@@ -232,6 +242,7 @@ struct AtomicBombState {
   bool bouncing = false;
   bool exploding = false;
   bool hitForcefield = false;
+  float blastScale = 1.0f;
   glm::vec3 position{0.0f};
   glm::vec3 velocity{0.0f};
   glm::vec3 impactPos{0.0f};
@@ -251,6 +262,8 @@ struct AppState {
   std::array<ChunkMesh, kChunkCount> chunkMeshes;
   std::optional<RaycastHit> hoveredBlock;
   BlockType selectedBlock = Crust;
+  float carriedFuel = kFuelStartingCarry;
+  int carriedPlutonium = 0;
   float satelliteOrbitYaw = 0.0f;
   float satelliteOrbitYawTarget = 0.0f;
   float satelliteOrbitPhase = 0.0f;
@@ -426,6 +439,8 @@ float miningDurationFor(BlockType type) {
     case Ember: return 0.55f;
     case DarkRock: return 0.85f;
     case Target: return 1000.0f;
+    case Fuel: return 0.60f;
+    case Plutonium: return 0.75f;
     case Air: return 0.0f;
   }
   return 0.5f;
@@ -437,6 +452,8 @@ float placementDurationFor(BlockType type) {
     case Ember: return 1.02f;
     case DarkRock: return 1.26f;
     case Target: return 1000.0f;
+    case Fuel: return 1000.0f;
+    case Plutonium: return 1000.0f;
     case Air: return 0.0f;
   }
   return 0.90f;
@@ -799,12 +816,14 @@ std::vector<std::uint8_t> generateAtlas(int tileSize, int gridSize) {
   writeTile(0, 1, {112, 31, 14}, {64, 12, 7}, true);
   writeTile(1, 1, {95, 22, 16}, {40, 7, 5}, false);
   writeTile(2, 0, {214, 182, 38}, {126, 96, 12}, false);
+  writeTile(2, 1, {38, 194, 210}, {12, 92, 118}, true);
+  writeTile(3, 0, {232, 214, 56}, {118, 104, 14}, true);
   return pixels;
 }
 
 GLuint createAtlasTexture() {
   constexpr int tileSize = 16;
-  constexpr int gridSize = 3;
+  constexpr int gridSize = 4;
   const auto pixels = generateAtlas(tileSize, gridSize);
 
   GLuint texture = 0;
@@ -821,12 +840,12 @@ GLuint createAtlasTexture() {
 }
 
 glm::vec2 atlasUv(int tileIndex, int corner) {
-  constexpr float columns = 3.0f;
+  constexpr float columns = 4.0f;
   constexpr float rows = 2.0f;
   const float tileU = 1.0f / columns;
   const float tileV = 1.0f / rows;
-  const int tileX = tileIndex % 3;
-  const int tileY = tileIndex / 3;
+  const int tileX = tileIndex % 4;
+  const int tileY = tileIndex / 4;
   const float u0 = tileX * tileU;
   const float v0 = tileY * tileV;
   const float u1 = u0 + tileU;
@@ -845,9 +864,11 @@ int textureIndexFor(BlockType type) {
   switch (type) {
     case Crust: return 0;
     case DarkRock: return 1;
-    case Ember: return 2;
-    case Target: return 4;
-    case Air: return 3;
+    case Ember: return 4;
+    case Target: return 2;
+    case Fuel: return 6;
+    case Plutonium: return 3;
+    case Air: return 7;
   }
   return 0;
 }
@@ -1008,6 +1029,14 @@ void generateWorld(World& world) {
           } else if (nearSurface && lavaScar > 0.72f) {
             type = DarkRock;
           }
+        }
+
+        const float fuelNoise = hashNoise3(x + 103, y + 211, z + 157);
+        const float plutoniumNoise = hashNoise3(x + 401, y + 97, z + 281);
+        if (surfaceDepth <= 3 && type != Air && type != Target && fuelNoise > 0.982f) {
+          type = Fuel;
+        } else if (surfaceDepth <= 3 && type != Air && type != Target && plutoniumNoise > 0.989f) {
+          type = Plutonium;
         }
 
         world.set(x, y, z, type);
@@ -1212,7 +1241,7 @@ void startAtomicBombExplosion(AppState& state, const glm::vec3& impactPos, bool 
   triggerCameraThump(state);
   triggerCameraSnap(state);
   if (!hitForcefield) {
-    clearExplosionCrater(state, impactPos, kAtomicBombCraterRadius);
+    clearExplosionCrater(state, impactPos, kAtomicBombCraterRadius * state.atomicBomb.blastScale);
   }
 }
 
@@ -1366,6 +1395,12 @@ void tryBreakBlock(AppState& state) {
     return;
   }
 
+  if (state.hoveredBlock->type == Fuel) {
+    state.carriedFuel = std::min(kFuelCarryMax, state.carriedFuel + kFuelPickupAmount);
+  } else if (state.hoveredBlock->type == Plutonium) {
+    state.carriedPlutonium += kPlutoniumPerPickup;
+  }
+
   state.world.set(block.x, block.y, block.z, Air);
   markDirtyAroundBlock(state, block.x, block.z);
   triggerHandSwing(state);
@@ -1457,10 +1492,15 @@ void dropAtomicBomb(AppState& state) {
   }
 
   const float orbitRadius = satelliteOrbitRadius(state.satelliteOrbitSpeed);
+  const bool fullStrength = state.carriedPlutonium >= kPlutoniumPerAtomicBomb;
+  if (fullStrength) {
+    state.carriedPlutonium -= kPlutoniumPerAtomicBomb;
+  }
   state.atomicBomb.active = true;
   state.atomicBomb.bouncing = false;
   state.atomicBomb.exploding = false;
   state.atomicBomb.hitForcefield = false;
+  state.atomicBomb.blastScale = fullStrength ? 1.0f : 0.5f;
   state.atomicBomb.position =
       satellitePositionAtAngle(state.satelliteOrbitPhase, state.satelliteOrbitYaw, state.satelliteOrbitSpeed);
   state.atomicBomb.velocity =
@@ -1538,6 +1578,10 @@ void updateAtomicBomb(AppState& state, float deltaTime) {
       state.atomicBomb.trailCount = 0;
     }
   }
+}
+
+void updateSatelliteFuel(AppState& state, float deltaTime) {
+  state.carriedFuel = std::max(0.0f, state.carriedFuel - kFuelDrainPerSecond * deltaTime);
 }
 
 void updateHand(AppState& state, float deltaTime) {
@@ -2001,7 +2045,7 @@ int main() {
     glGenVertexArrays(1, &skyVao);
     outlineVao = createOutlineVao(outlineVbo);
     solidCubeVao = createSolidCubeVao(solidCubeVbo);
-    orbitLineVao = createDynamicLineVao(orbitLineVbo, kSatelliteOrbitSegments + 1);
+    orbitLineVao = createDynamicLineVao(orbitLineVbo, kDynamicLineCapacity);
     rebuildDirtyChunks(state);
   } catch (const std::exception& ex) {
     std::cerr << ex.what() << '\n';
@@ -2023,6 +2067,7 @@ int main() {
     updateHand(state, deltaTime);
     updateCameraFeedback(state, deltaTime);
     updateAtomicBomb(state, deltaTime);
+    updateSatelliteFuel(state, deltaTime);
     rebuildDirtyChunks(state);
 
     int width = 0;
@@ -2086,6 +2131,7 @@ int main() {
 
     const auto drawForcefield = [&](const glm::mat4& drawView,
                                     const glm::mat4& drawProjection,
+                                    float brightness,
                                     bool alwaysVisible) {
       const glm::vec3 center = worldCenter();
       const float fieldWidth = static_cast<float>(kWorldX) * kBlockSize * kForcefieldOversize;
@@ -2107,9 +2153,9 @@ int main() {
         glDepthMask(GL_FALSE);
       }
       glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
-                  0.18f * fieldPulse,
-                  1.00f * fieldPulse,
-                  0.24f * fieldPulse);
+                  0.18f * fieldPulse * brightness,
+                  1.00f * fieldPulse * brightness,
+                  0.24f * fieldPulse * brightness);
       glDrawArrays(GL_TRIANGLES, 0, 36);
       if (alwaysVisible) {
         glDepthMask(GL_TRUE);
@@ -2118,13 +2164,11 @@ int main() {
       glEnable(GL_CULL_FACE);
     };
 
-    drawWorld(view, projection, eye, glm::vec3(0.23f, 0.05f, 0.04f), 1.0f, 0.013f);
-    drawForcefield(view, projection, false);
-
-    {
+    const auto drawAtomicBomb = [&](const glm::mat4& drawView,
+                                    const glm::mat4& drawProjection) {
       glUseProgram(colorProgram);
-      glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uView"), 1, GL_FALSE, glm::value_ptr(view));
-      glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uProjection"), 1, GL_FALSE, glm::value_ptr(projection));
+      glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uView"), 1, GL_FALSE, glm::value_ptr(drawView));
+      glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uProjection"), 1, GL_FALSE, glm::value_ptr(drawProjection));
       glBindVertexArray(solidCubeVao);
 
       if (state.atomicBomb.active || state.atomicBomb.bouncing) {
@@ -2165,18 +2209,19 @@ int main() {
       } else if (state.atomicBomb.exploding) {
         const float t = std::clamp(state.atomicBomb.explosionAge / kAtomicBombExplosionDuration, 0.0f, 1.0f);
         const float bloom = 1.0f - std::pow(1.0f - t, 2.6f);
+        const float blastRadius = kAtomicBombBlastRadius * state.atomicBomb.blastScale;
         const glm::vec3 flashColor =
             state.atomicBomb.hitForcefield ? glm::vec3(0.32f, 1.0f, 0.18f) : glm::vec3(1.0f, 0.92f, 0.56f);
         const glm::vec3 outerColor =
             state.atomicBomb.hitForcefield ? glm::vec3(0.08f, 0.82f, 0.18f) : glm::vec3(1.0f, 0.44f, 0.14f);
-        const float coreSize = glm::mix(0.8f * kBlockSize, 0.30f * kAtomicBombBlastRadius, bloom);
-        const float shellSize = glm::mix(1.1f * kBlockSize, 0.42f * kAtomicBombBlastRadius, bloom);
-        const float pillarHeight = glm::mix(1.4f * kBlockSize, kAtomicBombBlastRadius * 1.35f, bloom);
+        const float coreSize = glm::mix(0.8f * kBlockSize, 0.30f * blastRadius, bloom);
+        const float shellSize = glm::mix(1.1f * kBlockSize, 0.42f * blastRadius, bloom);
+        const float pillarHeight = glm::mix(1.4f * kBlockSize, blastRadius * 1.35f, bloom);
         const float stemWidth = glm::mix(0.75f * kBlockSize, 1.45f * kBlockSize, bloom);
-        const float capWidth = glm::mix(1.6f * kBlockSize, 0.95f * kAtomicBombBlastRadius, bloom);
-        const float capHeight = glm::mix(0.9f * kBlockSize, 0.34f * kAtomicBombBlastRadius, bloom);
-        const float collarWidth = glm::mix(1.0f * kBlockSize, 0.58f * kAtomicBombBlastRadius, bloom);
-        const float collarHeight = glm::mix(0.45f * kBlockSize, 0.15f * kAtomicBombBlastRadius, bloom);
+        const float capWidth = glm::mix(1.6f * kBlockSize, 0.95f * blastRadius, bloom);
+        const float capHeight = glm::mix(0.9f * kBlockSize, 0.34f * blastRadius, bloom);
+        const float collarWidth = glm::mix(1.0f * kBlockSize, 0.58f * blastRadius, bloom);
+        const float collarHeight = glm::mix(0.45f * kBlockSize, 0.15f * blastRadius, bloom);
         const float crownLift = glm::mix(0.9f * kBlockSize, 0.82f * pillarHeight, bloom);
         const float collarLift = glm::mix(0.45f * kBlockSize, 0.56f * pillarHeight, bloom);
         const float stemLift = glm::mix(0.25f * kBlockSize, 0.42f * pillarHeight, bloom);
@@ -2241,7 +2286,7 @@ int main() {
         glDrawArrays(GL_TRIANGLES, 0, 36);
 
         std::array<glm::vec3, kAtomicBombRingSegments + 1> blastRing{};
-        const float ringRadius = glm::mix(1.8f * kBlockSize, kAtomicBombBlastRadius, bloom);
+        const float ringRadius = glm::mix(1.8f * kBlockSize, blastRadius, bloom);
         const float ringY = state.atomicBomb.impactPos.y + (state.atomicBomb.hitForcefield ? 0.0f : 0.35f * kBlockSize);
         for (int i = 0; i <= kAtomicBombRingSegments; ++i) {
           const float angle = (static_cast<float>(i) / static_cast<float>(kAtomicBombRingSegments)) *
@@ -2276,7 +2321,11 @@ int main() {
 
         glEnable(GL_CULL_FACE);
       }
-    }
+    };
+
+    drawWorld(view, projection, eye, glm::vec3(0.23f, 0.05f, 0.04f), 1.0f, 0.013f);
+    drawForcefield(view, projection, 1.0f, false);
+    drawAtomicBomb(view, projection);
 
     {
         std::array<glm::vec3, kSatelliteOrbitSegments + 1> orbitPoints{};
@@ -2354,8 +2403,12 @@ int main() {
       glScissor(miniX, miniY, miniWidth, miniHeight);
       glClearColor(0.035f, 0.01f, 0.01f, 1.0f);
       glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-      drawWorld(miniView, miniProjection, satellitePos, glm::vec3(0.12f, 0.03f, 0.03f), 1.55f, 0.005f);
-      drawForcefield(miniView, miniProjection, true);
+      const bool satelliteFueled = state.carriedFuel > 0.001f;
+      if (satelliteFueled) {
+        drawWorld(miniView, miniProjection, satellitePos, glm::vec3(0.12f, 0.03f, 0.03f), 1.55f, 0.005f);
+        drawForcefield(miniView, miniProjection, 0.28f, false);
+        drawAtomicBomb(miniView, miniProjection);
+      }
 
       glUseProgram(colorProgram);
       glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uView"), 1, GL_FALSE, glm::value_ptr(identity));
@@ -2377,8 +2430,112 @@ int main() {
       glUniform3f(glGetUniformLocation(colorProgram, "uColor"), 0.72f, 0.18f, 0.12f);
       glDrawArrays(GL_LINE_STRIP, 0, static_cast<GLsizei>(miniFrame.size()));
 
-      if (const auto bombsite = predictBombsiteImpact(
-              state.world, state.satelliteOrbitPhase, state.satelliteOrbitYaw, state.satelliteOrbitSpeed)) {
+      glBindVertexArray(orbitLineVao);
+      glBindBuffer(GL_ARRAY_BUFFER, orbitLineVbo);
+      std::vector<glm::vec3> fuelTextLines;
+      fuelTextLines.reserve(48);
+      const auto addLine = [&](glm::vec2 a, glm::vec2 b) {
+        fuelTextLines.push_back(glm::vec3(a, 0.0f));
+        fuelTextLines.push_back(glm::vec3(b, 0.0f));
+      };
+      const auto addDigit = [&](int digit, float x, float y, float w, float h) {
+        const glm::vec2 topL(x, y);
+        const glm::vec2 topR(x + w, y);
+        const glm::vec2 midL(x, y - h * 0.5f);
+        const glm::vec2 midR(x + w, y - h * 0.5f);
+        const glm::vec2 botL(x, y - h);
+        const glm::vec2 botR(x + w, y - h);
+        const bool seg[10][7] = {
+            {true, true, true, false, true, true, true},     // 0
+            {false, false, true, false, false, true, false}, // 1
+            {true, false, true, true, true, false, true},    // 2
+            {true, false, true, true, false, true, true},    // 3
+            {false, true, true, true, false, true, false},   // 4
+            {true, true, false, true, false, true, true},    // 5
+            {true, true, false, true, true, true, true},     // 6
+            {true, false, true, false, false, true, false},  // 7
+            {true, true, true, true, true, true, true},      // 8
+            {true, true, true, true, false, true, true},     // 9
+        };
+        if (seg[digit][0]) addLine(topL, topR);
+        if (seg[digit][1]) addLine(topL, midL);
+        if (seg[digit][2]) addLine(topR, midR);
+        if (seg[digit][3]) addLine(midL, midR);
+        if (seg[digit][4]) addLine(midL, botL);
+        if (seg[digit][5]) addLine(midR, botR);
+        if (seg[digit][6]) addLine(botL, botR);
+      };
+      const auto addSlash = [&](float x, float y, float w, float h) {
+        addLine(glm::vec2(x, y - h), glm::vec2(x + w, y));
+      };
+      const auto addNumber = [&](int value, float& cursor, float y, float w, float h, float spacing) {
+        const std::string text = std::to_string(value);
+        for (char ch : text) {
+          addDigit(ch - '0', cursor, y, w, h);
+          cursor += w + spacing;
+        }
+      };
+
+      const int shownFuel = static_cast<int>(std::ceil(state.carriedFuel));
+      const int shownMaxFuel = static_cast<int>(kFuelCarryMax);
+      float cursor = -0.80f;
+      const float textY = 0.84f;
+      const float digitW = 0.11f;
+      const float digitH = 0.16f;
+      const float spacing = 0.035f;
+      addNumber(shownFuel, cursor, textY, digitW, digitH, spacing);
+      addSlash(cursor + 0.01f, textY, 0.07f, digitH);
+      cursor += 0.11f;
+      addNumber(shownMaxFuel, cursor, textY, digitW, digitH, spacing);
+      const std::string plutoniumText = std::to_string(state.carriedPlutonium);
+      const float plutoniumDigitW = digitW * 0.9f;
+      const float plutoniumDigitH = digitH * 0.9f;
+      const float plutoniumSpacing = spacing * 0.9f;
+      const float plutoniumY = 0.84f;
+      const float plutoniumWidth =
+          static_cast<float>(plutoniumText.size()) * plutoniumDigitW +
+          static_cast<float>(std::max(0, static_cast<int>(plutoniumText.size()) - 1)) * plutoniumSpacing;
+      float plutoniumCursor = 0.80f - plutoniumWidth;
+      addNumber(state.carriedPlutonium, plutoniumCursor, plutoniumY, plutoniumDigitW, plutoniumDigitH, plutoniumSpacing);
+
+      if (!fuelTextLines.empty()) {
+        glBufferSubData(GL_ARRAY_BUFFER, 0,
+                        static_cast<GLsizeiptr>(fuelTextLines.size() * sizeof(glm::vec3)),
+                        fuelTextLines.data());
+        glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(identity));
+        glUniform3f(glGetUniformLocation(colorProgram, "uColor"), 0.90f, 0.72f, 0.22f);
+        glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(fuelTextLines.size()));
+      }
+
+      if (!satelliteFueled) {
+        std::array<glm::vec3, kSatelliteNoiseSegments * 2> noiseLines{};
+        const int noiseTime = static_cast<int>(currentFrame * 28.0f);
+        for (int i = 0; i < kSatelliteNoiseSegments; ++i) {
+          const float x0 = hashNoise(noiseTime * 19 + i * 37, noiseTime * 7 + i * 13) * 1.92f - 0.96f;
+          const float y0 = hashNoise(noiseTime * 11 + i * 17, noiseTime * 23 + i * 29) * 1.92f - 0.96f;
+          const float dx = (hashNoise(noiseTime * 31 + i * 41, noiseTime * 5 + i * 47) - 0.5f) * 0.16f;
+          const float dy = (hashNoise(noiseTime * 43 + i * 53, noiseTime * 3 + i * 59) - 0.5f) * 0.10f;
+          noiseLines[static_cast<std::size_t>(i * 2)] = glm::vec3(x0, y0, 0.0f);
+          noiseLines[static_cast<std::size_t>(i * 2 + 1)] = glm::vec3(x0 + dx, y0 + dy, 0.0f);
+        }
+        glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(noiseLines), noiseLines.data());
+        glUniform3f(glGetUniformLocation(colorProgram, "uColor"), 0.42f, 0.86f, 0.78f);
+        glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(noiseLines.size()));
+
+        std::array<glm::vec3, 16> tearLines{};
+        for (int i = 0; i < 8; ++i) {
+          const float y = hashNoise(noiseTime * 61 + i * 17, noiseTime * 67 + i * 13) * 1.8f - 0.9f;
+          tearLines[static_cast<std::size_t>(i * 2)] = glm::vec3(-0.96f, y, 0.0f);
+          tearLines[static_cast<std::size_t>(i * 2 + 1)] = glm::vec3(0.96f, y, 0.0f);
+        }
+        glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(tearLines), tearLines.data());
+        glUniform3f(glGetUniformLocation(colorProgram, "uColor"), 0.92f, 0.96f, 0.96f);
+        glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(tearLines.size()));
+      }
+
+      if (satelliteFueled) {
+        if (const auto bombsite = predictBombsiteImpact(
+                state.world, state.satelliteOrbitPhase, state.satelliteOrbitYaw, state.satelliteOrbitSpeed)) {
         const glm::vec4 clip = miniProjection * miniView * glm::vec4(bombsite->impactPos, 1.0f);
         if (clip.w > 0.0001f) {
           const glm::vec3 ndc = glm::vec3(clip) / clip.w;
@@ -2454,6 +2611,7 @@ int main() {
             glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(centerTick.size()));
           }
         }
+      }
       }
 
       glDepthMask(GL_TRUE);

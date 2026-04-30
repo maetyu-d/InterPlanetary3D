@@ -11,6 +11,8 @@ Small C++ voxel prototype using OpenGL, GLFW, and GLAD.
 - Block placement and removal
 - Targeted block outline for clearer interaction
 - Animated infernal sky and heavier red fog for a hellish look
+- Collectible fuel blocks that keep the satellite feed alive
+- Toxic-yellow plutonium blocks used to arm atomic bombs
 
 ## Build
 
@@ -39,3 +41,5 @@ cd /Users/user/Documents/MineyCraft
 - `Hold Right Click`: place block
 - `1 / 2 / 3`: switch block type
 - `Esc`: release mouse
+
+Break glowing cyan fuel blocks to refill the satellite feed. Break toxic-yellow plutonium blocks to stockpile bomb material. Each atomic bomb costs `2` plutonium. When fuel runs out, the satellite camera collapses into static.
