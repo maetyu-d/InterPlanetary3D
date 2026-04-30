@@ -47,6 +47,11 @@ constexpr float kFuelPickupAmount = 1.0f;
 constexpr float kFuelDrainPerSecond = 0.05f;
 constexpr float kFuelCarryMax = 12.0f;
 constexpr float kFuelStartingCarry = 4.0f;
+constexpr float kPlayerMaxHealth = 100.0f;
+constexpr float kPlayerVoidFatalDamage = 999.0f;
+constexpr float kPlayerForcefieldFatalDamage = 999.0f;
+constexpr float kPlayerAtomicBombBaseDamage = 80.0f;
+constexpr float kPlayerDamageFlashDecay = 1.4f;
 constexpr int kPlutoniumPerPickup = 1;
 constexpr int kPlutoniumPerAtomicBomb = 2;
 constexpr float kBombDropGravity = 17.0f * kBlockSize;
@@ -242,6 +247,7 @@ struct AtomicBombState {
   bool bouncing = false;
   bool exploding = false;
   bool hitForcefield = false;
+  bool damageApplied = false;
   float blastScale = 1.0f;
   glm::vec3 position{0.0f};
   glm::vec3 velocity{0.0f};
@@ -262,6 +268,8 @@ struct AppState {
   std::array<ChunkMesh, kChunkCount> chunkMeshes;
   std::optional<RaycastHit> hoveredBlock;
   BlockType selectedBlock = Crust;
+  float playerHealth = kPlayerMaxHealth;
+  float playerDamageFlash = 0.0f;
   float carriedFuel = kFuelStartingCarry;
   int carriedPlutonium = 0;
   float satelliteOrbitYaw = 0.0f;
@@ -286,6 +294,8 @@ void triggerCameraThump(AppState& state);
 void triggerCameraSnap(AppState& state);
 void resetMining(AppState& state);
 void resetPlacement(AppState& state);
+void respawnPlayer(AppState& state);
+void applyPlayerDamage(AppState& state, float amount);
 void dropAtomicBomb(AppState& state);
 void updateAtomicBomb(AppState& state, float deltaTime);
 
@@ -1500,6 +1510,7 @@ void dropAtomicBomb(AppState& state) {
   state.atomicBomb.bouncing = false;
   state.atomicBomb.exploding = false;
   state.atomicBomb.hitForcefield = false;
+  state.atomicBomb.damageApplied = false;
   state.atomicBomb.blastScale = fullStrength ? 1.0f : 0.5f;
   state.atomicBomb.position =
       satellitePositionAtAngle(state.satelliteOrbitPhase, state.satelliteOrbitYaw, state.satelliteOrbitSpeed);
@@ -1571,10 +1582,21 @@ void updateAtomicBomb(AppState& state, float deltaTime) {
       startAtomicBombExplosion(state, state.atomicBomb.impactPos, state.atomicBomb.hitForcefield);
     }
   } else if (state.atomicBomb.exploding) {
+    if (!state.atomicBomb.damageApplied) {
+      const float blastRadius = kAtomicBombBlastRadius * state.atomicBomb.blastScale;
+      const glm::vec3 playerCenter = state.player.position + glm::vec3(0.0f, kPlayerHeight * 0.5f, 0.0f);
+      const float distance = glm::distance(playerCenter, state.atomicBomb.impactPos);
+      if (distance < blastRadius) {
+        const float falloff = 1.0f - std::clamp(distance / blastRadius, 0.0f, 1.0f);
+        applyPlayerDamage(state, kPlayerAtomicBombBaseDamage * state.atomicBomb.blastScale * falloff);
+      }
+      state.atomicBomb.damageApplied = true;
+    }
     state.atomicBomb.explosionAge += deltaTime;
     if (state.atomicBomb.explosionAge >= kAtomicBombExplosionDuration) {
       state.atomicBomb.exploding = false;
       state.atomicBomb.hitForcefield = false;
+      state.atomicBomb.damageApplied = false;
       state.atomicBomb.trailCount = 0;
     }
   }
@@ -1582,6 +1604,30 @@ void updateAtomicBomb(AppState& state, float deltaTime) {
 
 void updateSatelliteFuel(AppState& state, float deltaTime) {
   state.carriedFuel = std::max(0.0f, state.carriedFuel - kFuelDrainPerSecond * deltaTime);
+}
+
+void respawnPlayer(AppState& state) {
+  state.player.position = state.spawnPosition;
+  state.player.velocity = glm::vec3(0.0f);
+  state.player.onGround = false;
+  state.playerHealth = kPlayerMaxHealth;
+  state.playerDamageFlash = 1.0f;
+  resetMining(state);
+  resetPlacement(state);
+  triggerCameraSnap(state);
+}
+
+void applyPlayerDamage(AppState& state, float amount) {
+  if (amount <= 0.0f) {
+    return;
+  }
+
+  state.playerHealth = std::max(0.0f, state.playerHealth - amount);
+  state.playerDamageFlash = 1.0f;
+  triggerCameraThump(state);
+  if (state.playerHealth <= 0.0f) {
+    respawnPlayer(state);
+  }
 }
 
 void updateHand(AppState& state, float deltaTime) {
@@ -1612,6 +1658,8 @@ void updateCameraFeedback(AppState& state, float deltaTime) {
       state.cameraFx.snapping = false;
     }
   }
+
+  state.playerDamageFlash = std::max(0.0f, state.playerDamageFlash - deltaTime * kPlayerDamageFlashDecay);
 }
 
 void framebufferSizeCallback(GLFWwindow*, int width, int height) {
@@ -1774,10 +1822,10 @@ void updateMovement(GLFWwindow* window, AppState& state, float deltaTime) {
     state.satelliteOrbitPhase = std::fmod(state.satelliteOrbitPhase, glm::two_pi<float>());
   }
 
-  if (playerTouchesForcefield(state.player.position) || state.player.position.y < 2.0f * kBlockSize) {
-    state.player.position = state.spawnPosition;
-    state.player.velocity = glm::vec3(0.0f);
-    state.player.onGround = false;
+  if (playerTouchesForcefield(state.player.position)) {
+    applyPlayerDamage(state, kPlayerForcefieldFatalDamage);
+  } else if (state.player.position.y < 2.0f * kBlockSize) {
+    applyPlayerDamage(state, kPlayerVoidFatalDamage);
   }
 }
 
@@ -2711,6 +2759,72 @@ int main() {
         glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(brackets), brackets.data());
         glUniform3f(glGetUniformLocation(colorProgram, "uColor"), 1.0f, 0.70f, 0.32f);
         glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(brackets.size()));
+      }
+
+      std::vector<glm::vec3> healthTextLines;
+      healthTextLines.reserve(48);
+      const auto addHudLine = [&](glm::vec2 a, glm::vec2 b) {
+        healthTextLines.push_back(glm::vec3(a, 0.0f));
+        healthTextLines.push_back(glm::vec3(b, 0.0f));
+      };
+      const auto addHudDigit = [&](int digit, float x, float y, float w, float h) {
+        const glm::vec2 topL(x, y);
+        const glm::vec2 topR(x + w, y);
+        const glm::vec2 midL(x, y - h * 0.5f);
+        const glm::vec2 midR(x + w, y - h * 0.5f);
+        const glm::vec2 botL(x, y - h);
+        const glm::vec2 botR(x + w, y - h);
+        const bool seg[10][7] = {
+            {true, true, true, false, true, true, true},
+            {false, false, true, false, false, true, false},
+            {true, false, true, true, true, false, true},
+            {true, false, true, true, false, true, true},
+            {false, true, true, true, false, true, false},
+            {true, true, false, true, false, true, true},
+            {true, true, false, true, true, true, true},
+            {true, false, true, false, false, true, false},
+            {true, true, true, true, true, true, true},
+            {true, true, true, true, false, true, true},
+        };
+        if (seg[digit][0]) addHudLine(topL, topR);
+        if (seg[digit][1]) addHudLine(topL, midL);
+        if (seg[digit][2]) addHudLine(topR, midR);
+        if (seg[digit][3]) addHudLine(midL, midR);
+        if (seg[digit][4]) addHudLine(midL, botL);
+        if (seg[digit][5]) addHudLine(midR, botR);
+        if (seg[digit][6]) addHudLine(botL, botR);
+      };
+      const auto addHudSlash = [&](float x, float y, float w, float h) {
+        addHudLine(glm::vec2(x, y - h), glm::vec2(x + w, y));
+      };
+      const auto addHudNumber = [&](int value, float& cursor, float y, float w, float h, float spacing) {
+        const std::string text = std::to_string(value);
+        for (char ch : text) {
+          addHudDigit(ch - '0', cursor, y, w, h);
+          cursor += w + spacing;
+        }
+      };
+
+      const int shownHealth = static_cast<int>(std::ceil(state.playerHealth));
+      float healthCursor = -0.92f;
+      const float healthY = 0.90f;
+      const float healthDigitW = 0.080f;
+      const float healthDigitH = 0.120f;
+      const float healthSpacing = 0.026f;
+      addHudNumber(shownHealth, healthCursor, healthY, healthDigitW, healthDigitH, healthSpacing);
+      addHudSlash(healthCursor + 0.008f, healthY, 0.055f, healthDigitH);
+      healthCursor += 0.09f;
+      addHudNumber(static_cast<int>(kPlayerMaxHealth), healthCursor, healthY, healthDigitW, healthDigitH, healthSpacing);
+      if (!healthTextLines.empty()) {
+        const float healthRatio = std::clamp(state.playerHealth / kPlayerMaxHealth, 0.0f, 1.0f);
+        glm::vec3 healthColor =
+            glm::mix(glm::vec3(1.0f, 0.28f, 0.18f), glm::vec3(1.0f, 0.88f, 0.72f), healthRatio);
+        healthColor = glm::mix(healthColor, glm::vec3(1.0f, 1.0f, 1.0f), state.playerDamageFlash * 0.65f);
+        glBufferSubData(GL_ARRAY_BUFFER, 0,
+                        static_cast<GLsizeiptr>(healthTextLines.size() * sizeof(glm::vec3)),
+                        healthTextLines.data());
+        glUniform3f(glGetUniformLocation(colorProgram, "uColor"), healthColor.x, healthColor.y, healthColor.z);
+        glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(healthTextLines.size()));
       }
 
       glEnable(GL_CULL_FACE);

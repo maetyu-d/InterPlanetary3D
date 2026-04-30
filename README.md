@@ -13,6 +13,7 @@ Small C++ voxel prototype using OpenGL, GLFW, and GLAD.
 - Animated infernal sky and heavier red fog for a hellish look
 - Collectible fuel blocks that keep the satellite feed alive
 - Toxic-yellow plutonium blocks used to arm atomic bombs
+- Player health with hazard and blast damage
 
 ## Build
 
@@ -43,3 +44,4 @@ cd /Users/user/Documents/MineyCraft
 - `Esc`: release mouse
 
 Break glowing cyan fuel blocks to refill the satellite feed. Break toxic-yellow plutonium blocks to stockpile bomb material. Each atomic bomb costs `2` plutonium. When fuel runs out, the satellite camera collapses into static.
+Nearby atomic blasts hurt, and touching the forcefield is instantly fatal.
