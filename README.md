@@ -41,7 +41,7 @@ cd /Users/user/Documents/InterPlanetary3D
 - `P`: drop an atomic bomb from the satellite
 - `Hold Left Click`: dig and remove block
 - `Hold Right Click`: place block
-- `1 / 2 / 3`: switch block type
+- `1 / 2`: switch between regular and hard block
 - `Esc`: release mouse
 
 Player 2 uses a control pad on the right screen:
@@ -54,7 +54,9 @@ Player 2 uses a control pad on the right screen:
 - `Right trigger`: dig block
 - `Left / right bumper`: rotate player 2's satellite orbit
 - `X / Y`: slow down or speed up player 2's satellite
-- `D-pad left / up / right`: switch block type
+- `D-pad left`: select regular block
+- `D-pad up / right`: select hard block
 
 Break glowing cyan fuel blocks to refill the satellite feed. Break toxic-yellow plutonium blocks to stockpile bomb material. Each atomic bomb costs `2` plutonium. When fuel runs out, the satellite camera collapses into static.
 Nearby atomic blasts hurt, and touching the forcefield is instantly fatal.
+Regular blocks are faster to build. Hard blocks take three times as long to build, take twice as long to dig through, and provide roughly twice the blast shielding.

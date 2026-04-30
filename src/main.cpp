@@ -498,8 +498,8 @@ bool sameBlock(const glm::ivec3& a, const glm::ivec3& b) {
 float miningDurationFor(BlockType type) {
   switch (type) {
     case Crust: return 0.35f;
+    case DarkRock: return 0.70f;
     case Ember: return 0.55f;
-    case DarkRock: return 0.85f;
     case Target: return 1000.0f;
     case Fuel: return 0.60f;
     case Plutonium: return 0.75f;
@@ -511,14 +511,44 @@ float miningDurationFor(BlockType type) {
 float placementDurationFor(BlockType type) {
   switch (type) {
     case Crust: return 0.78f;
+    case DarkRock: return 2.34f;
     case Ember: return 1.02f;
-    case DarkRock: return 1.26f;
     case Target: return 1000.0f;
     case Fuel: return 1000.0f;
     case Plutonium: return 1000.0f;
     case Air: return 0.0f;
   }
   return 0.90f;
+}
+
+float blockShieldingValue(BlockType type) {
+  switch (type) {
+    case DarkRock: return 2.0f;
+    case Air: return 0.0f;
+    default: return 1.0f;
+  }
+}
+
+float blastShieldingBetween(const World& world, const glm::vec3& start, const glm::vec3& end) {
+  const glm::vec3 delta = end - start;
+  const float distance = glm::length(delta);
+  if (distance <= 0.0001f) {
+    return 0.0f;
+  }
+
+  const glm::vec3 direction = delta / distance;
+  float shielding = 0.0f;
+  glm::ivec3 previousBlock(999999);
+  for (float travelled = kStep; travelled < distance - kStep; travelled += kStep) {
+    const glm::ivec3 block = worldToBlock(start + direction * travelled);
+    if (sameBlock(block, previousBlock)) {
+      continue;
+    }
+    previousBlock = block;
+    shielding += blockShieldingValue(world.get(block.x, block.y, block.z));
+  }
+
+  return shielding;
 }
 
 MissileSolution buildMissileSolution(const AppState& state, std::optional<float> powerOverride = std::nullopt) {
@@ -1688,8 +1718,10 @@ void updateAtomicBomb(AppState& state, float deltaTime) {
         const float distance = glm::distance(playerCenter, state.atomicBomb.impactPos);
         if (distance < blastRadius) {
           const float falloff = 1.0f - std::clamp(distance / blastRadius, 0.0f, 1.0f);
+          const float shielding = blastShieldingBetween(state.world, state.atomicBomb.impactPos, playerCenter);
+          const float shieldingMultiplier = 1.0f / (1.0f + shielding * 0.45f);
           applyPlayerDamage(state, playerIndex,
-                            kPlayerAtomicBombBaseDamage * state.atomicBomb.blastScale * falloff,
+                            kPlayerAtomicBombBaseDamage * state.atomicBomb.blastScale * falloff * shieldingMultiplier,
                             state.atomicBomb.ownerIndex);
         }
       }
@@ -2121,7 +2153,6 @@ void handleBlockInput(GLFWwindow* window, AppState& state, float deltaTime) {
 
   if (glfwGetKey(window, GLFW_KEY_1) == GLFW_PRESS) playerOne.selectedBlock = Crust;
   if (glfwGetKey(window, GLFW_KEY_2) == GLFW_PRESS) playerOne.selectedBlock = DarkRock;
-  if (glfwGetKey(window, GLFW_KEY_3) == GLFW_PRESS) playerOne.selectedBlock = Ember;
 
   GLFWgamepadstate gamepadState{};
   PlayerState& playerTwo = state.players[1];
@@ -2134,8 +2165,10 @@ void handleBlockInput(GLFWwindow* window, AppState& state, float deltaTime) {
     const bool upSelect = gamepadState.buttons[GLFW_GAMEPAD_BUTTON_DPAD_UP] == GLFW_PRESS;
     const bool rightSelect = gamepadState.buttons[GLFW_GAMEPAD_BUTTON_DPAD_RIGHT] == GLFW_PRESS;
     if (leftSelect && !playerTwo.blockCycleLeftLastFrame) playerTwo.selectedBlock = Crust;
-    if (upSelect && !playerTwo.blockCycleUpLastFrame) playerTwo.selectedBlock = DarkRock;
-    if (rightSelect && !playerTwo.blockCycleRightLastFrame) playerTwo.selectedBlock = Ember;
+    if ((upSelect && !playerTwo.blockCycleUpLastFrame) ||
+        (rightSelect && !playerTwo.blockCycleRightLastFrame)) {
+      playerTwo.selectedBlock = DarkRock;
+    }
     playerTwo.blockCycleLeftLastFrame = leftSelect;
     playerTwo.blockCycleUpLastFrame = upSelect;
     playerTwo.blockCycleRightLastFrame = rightSelect;
