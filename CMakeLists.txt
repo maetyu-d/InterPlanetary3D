@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(MineyCraft VERSION 0.1.0 LANGUAGES CXX)
+project(InterPlanetary3D VERSION 0.1.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -37,11 +37,11 @@ FetchContent_MakeAvailable(glfw glad glm)
 
 find_package(OpenGL REQUIRED)
 
-add_executable(mineycraft
+add_executable(InterPlanetary3D
   src/main.cpp
 )
 
-target_link_libraries(mineycraft
+target_link_libraries(InterPlanetary3D
   PRIVATE
     OpenGL::GL
     glfw
@@ -49,8 +49,8 @@ target_link_libraries(mineycraft
     glm
 )
 
-target_compile_definitions(mineycraft PRIVATE GL_SILENCE_DEPRECATION)
+target_compile_definitions(InterPlanetary3D PRIVATE GL_SILENCE_DEPRECATION)
 
 if(APPLE)
-  target_compile_definitions(mineycraft PRIVATE GL_SILENCE_DEPRECATION)
+  target_compile_definitions(InterPlanetary3D PRIVATE GL_SILENCE_DEPRECATION)
 endif()

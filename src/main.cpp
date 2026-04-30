@@ -2284,7 +2284,8 @@ int main() {
   glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
 #endif
 
-  GLFWwindow* window = glfwCreateWindow(kWindowWidth, kWindowHeight, "MineyCraft (OpenGL)", nullptr, nullptr);
+  GLFWwindow* window = glfwCreateWindow(
+      kWindowWidth, kWindowHeight, "InterPlanetary3D by matd.space", nullptr, nullptr);
   if (!window) {
     std::cerr << "Failed to create window.\n";
     glfwTerminate();

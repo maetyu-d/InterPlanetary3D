@@ -1,6 +1,6 @@
-# MineyCraft
+# InterPlanetary3D
 
-Small C++ voxel prototype using OpenGL, GLFW, and GLAD.
+InterPlanetary3D is a split-screen voxel combat prototype by `matd.space`, built with C++, OpenGL, GLFW, and GLAD.
 
 ## Features
 
@@ -19,7 +19,7 @@ Small C++ voxel prototype using OpenGL, GLFW, and GLAD.
 ## Build
 
 ```bash
-cd /Users/user/Documents/MineyCraft
+cd /Users/user/Documents/InterPlanetary3D
 cmake -S . -B build
 cmake --build build
 ```
@@ -27,8 +27,8 @@ cmake --build build
 ## Run
 
 ```bash
-cd /Users/user/Documents/MineyCraft
-./build/mineycraft
+cd /Users/user/Documents/InterPlanetary3D
+./build/InterPlanetary3D
 ```
 
 ## Controls
