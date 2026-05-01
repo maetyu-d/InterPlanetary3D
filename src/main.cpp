@@ -54,6 +54,9 @@ constexpr float kPlayerVoidFatalDamage = 999.0f;
 constexpr float kPlayerForcefieldFatalDamage = 999.0f;
 constexpr float kPlayerAtomicBombBaseDamage = 80.0f;
 constexpr float kPlayerDamageFlashDecay = 1.4f;
+constexpr int kFreePlayTargetKills = 3;
+constexpr int kTurnBasedRounds = 10;
+constexpr float kTurnRoundDuration = 60.0f;
 constexpr int kPlutoniumPerPickup = 1;
 constexpr int kPlutoniumPerAtomicBomb = 2;
 constexpr float kBombDropGravity = 17.0f * kBlockSize;
@@ -252,6 +255,16 @@ struct SatelliteState {
   float orbitSpeedTarget = 1.0f;
 };
 
+enum class GameMode : std::uint8_t {
+  FreePlay = 0,
+  TurnBased = 1,
+};
+
+enum class TurnPhase : std::uint8_t {
+  Build = 0,
+  Attack = 1,
+};
+
 struct PlayerState {
   Player avatar;
   bool invertedGravity = false;
@@ -291,10 +304,21 @@ struct AtomicBombState {
   int trailCount = 0;
 };
 
+struct MatchState {
+  GameMode mode = GameMode::FreePlay;
+  TurnPhase phase = TurnPhase::Attack;
+  int roundNumber = 1;
+  float roundTimeRemaining = kTurnRoundDuration;
+  bool suddenDeath = false;
+  bool matchOver = false;
+  int winnerIndex = -1;
+};
+
 struct AppState {
   std::array<PlayerState, 2> players;
   std::array<glm::vec3, 2> spawnPositions{};
   std::array<int, 2> scores{0, 0};
+  MatchState match;
   InputState input;
   World world;
   std::array<ChunkMesh, kChunkCount> chunkMeshes;
@@ -312,10 +336,14 @@ void triggerCameraThump(PlayerState& playerState);
 void triggerCameraSnap(PlayerState& playerState);
 void resetMining(PlayerState& playerState);
 void resetPlacement(PlayerState& playerState);
+bool canMineAndBuild(const AppState& state);
+bool canAttack(const AppState& state);
+bool satellitesOnline(const AppState& state);
 void respawnPlayer(AppState& state, int playerIndex, std::optional<int> killerIndex = std::nullopt);
 void applyPlayerDamage(AppState& state, int playerIndex, float amount, std::optional<int> attackerIndex = std::nullopt);
 void dropAtomicBomb(AppState& state, int ownerIndex);
 void updateAtomicBomb(AppState& state, float deltaTime);
+void resetMatch(AppState& state, GameMode mode);
 
 int chunkIndexForCoords(int chunkX, int chunkZ) {
   return chunkZ * kWorldChunksX + chunkX;
@@ -710,6 +738,7 @@ GLuint createWorldProgram() {
     uniform vec3 uFogColor;
     uniform float uExposure;
     uniform float uFogDensity;
+    uniform float uContrastBoost;
 
     void main() {
       vec3 tex = texture(uAtlas, vUv).rgb;
@@ -730,6 +759,14 @@ GLuint createWorldProgram() {
       lowLight += topBias + bottomBias + sideBias;
 
       float emberGlow = smoothstep(0.24, 0.42, tex.r - tex.g) * 0.26;
+      float warmMetalMask =
+          smoothstep(0.72, 0.90, tex.r) *
+          smoothstep(0.62, 0.84, tex.g) *
+          (1.0 - smoothstep(0.24, 0.42, tex.b));
+      float coolResourceMask =
+          smoothstep(0.62, 0.84, tex.g) *
+          smoothstep(0.70, 0.90, tex.b) *
+          (1.0 - smoothstep(0.28, 0.46, tex.r));
       float radialDistance = length(vWorldPos - uWorldCenter);
       float verticalHeat = smoothstep(10.0, 28.0, radialDistance) * (0.08 + topBias * 0.34);
       vec3 lit = tex * (lowLight + emberGlow + verticalHeat);
@@ -739,16 +776,31 @@ GLuint createWorldProgram() {
 
       float lowerHalf = smoothstep(-0.75, 0.75, uWorldCenter.y - vWorldPos.y);
       vec3 upperTint = vec3(1.00, 0.82, 0.82);
-      vec3 lowerTint = vec3(0.18, 0.34, 1.32);
-      lit *= mix(upperTint, lowerTint, lowerHalf);
+      vec3 lowerTint = vec3(0.34, 0.68, 2.24);
+      vec3 lowerLift = vec3(lit.r * 0.24, lit.g * 0.64, lit.b * 1.72);
+      lit = mix(lit * upperTint, lowerLift * lowerTint, lowerHalf);
+      lit += vec3(0.01, 0.04, 0.12) * lowerHalf;
+
+      float crease = clamp(1.0 - vAo, 0.0, 1.0);
+      float blueRim = rim * (0.55 + shadowBand * 1.35) * lowerHalf;
+      lit += vec3(0.10, 0.24, 0.58) * blueRim;
+      lit = mix(lit, lit * 0.52, crease * 0.42 * lowerHalf);
+      lit = mix(lit, lit * 1.28, shadowBand * 0.34 * lowerHalf);
+      vec3 warmMetalLit = tex * (lowLight * 1.55 + 0.32 + verticalHeat * 0.55);
+      lit = mix(lit, warmMetalLit, warmMetalMask * lowerHalf);
+      vec3 coolResourceLit = tex * (lowLight * 1.42 + 0.28 + verticalHeat * 0.40);
+      lit = mix(lit, coolResourceLit, coolResourceMask * lowerHalf);
 
       float dist = distance(uCameraPos, vWorldPos);
-      float groundFog = smoothstep(13.0, -6.0, vWorldPos.y) * 0.12;
+      float groundFog = smoothstep(13.0, -6.0, vWorldPos.y) * mix(0.12, 0.06, lowerHalf);
       float fogFactor = clamp(1.0 - exp(-(dist * uFogDensity + groundFog)), 0.0, 1.0);
-      vec3 lowerFogColor = vec3(0.05, 0.10, 0.24);
+      vec3 lowerFogColor = vec3(0.06, 0.14, 0.44);
       vec3 fogColor = mix(uFogColor, lowerFogColor, lowerHalf);
       vec3 color = mix(lit, fogColor, fogFactor);
-      color = mix(color * 0.72, color * 1.16, shadowBand);
+      color = mix(color * 0.66, color * 1.24, shadowBand);
+      color *= mix(1.0, 1.10, lowerHalf);
+      color = clamp((color - vec3(0.5)) * uContrastBoost + vec3(0.5), 0.0, 1.0);
+      color = mix(color, sqrt(clamp(color, 0.0, 1.0)), clamp((uContrastBoost - 1.0) * 0.52, 0.0, 0.45));
 
       FragColor = vec4(color * uExposure, 1.0);
     }
@@ -787,18 +839,18 @@ GLuint createSkyProgram() {
     out vec4 FragColor;
 
     uniform float uTime;
+    uniform vec3 uTopTint;
+    uniform vec3 uHorizonTint;
+    uniform vec3 uPitTint;
 
     void main() {
-      vec3 top = vec3(0.18, 0.03, 0.02);
-      vec3 horizon = vec3(0.58, 0.16, 0.08);
-      vec3 pit = vec3(0.03, 0.00, 0.00);
-
       float horizonBand = smoothstep(0.10, 0.62, vUv.y);
-      vec3 color = mix(pit, horizon, horizonBand);
-      color = mix(color, top, smoothstep(0.58, 1.0, vUv.y));
+      vec3 color = mix(uPitTint, uHorizonTint, horizonBand);
+      color = mix(color, uTopTint, smoothstep(0.58, 1.0, vUv.y));
 
       float heatWave = sin(vUv.x * 19.0 + uTime * 0.3) * 0.01 + sin(vUv.x * 7.0 - uTime * 0.15) * 0.015;
-      color += vec3(0.18, 0.05, 0.01) * smoothstep(0.15, 0.55, vUv.y + heatWave) * (1.0 - smoothstep(0.55, 0.9, vUv.y));
+      vec3 shimmerTint = mix(vec3(0.18, 0.05, 0.01), vec3(0.08, 0.18, 0.34), clamp(uHorizonTint.b * 1.2, 0.0, 1.0));
+      color += shimmerTint * smoothstep(0.15, 0.55, vUv.y + heatWave) * (1.0 - smoothstep(0.55, 0.9, vUv.y));
       color = pow(color, vec3(0.82));
 
       FragColor = vec4(color, 1.0);
@@ -831,9 +883,10 @@ GLuint createOutlineProgram() {
     #version 330 core
     out vec4 FragColor;
     uniform vec3 uColor;
+    uniform float uAlpha;
 
     void main() {
-      FragColor = vec4(uColor, 1.0);
+      FragColor = vec4(uColor, uAlpha);
     }
   )";
 
@@ -1738,15 +1791,39 @@ void updateAtomicBomb(AppState& state, float deltaTime) {
 }
 
 void updateSatelliteFuel(AppState& state, float deltaTime) {
+  if (!satellitesOnline(state)) {
+    return;
+  }
   for (PlayerState& playerState : state.players) {
     playerState.carriedFuel = std::max(0.0f, playerState.carriedFuel - kFuelDrainPerSecond * deltaTime);
   }
 }
 
 void respawnPlayer(AppState& state, int playerIndex, std::optional<int> killerIndex) {
+  int creditedWinner = -1;
   if (killerIndex.has_value() && killerIndex.value() != playerIndex &&
       killerIndex.value() >= 0 && killerIndex.value() < static_cast<int>(state.scores.size())) {
-    state.scores[static_cast<std::size_t>(killerIndex.value())] += 1;
+    creditedWinner = killerIndex.value();
+    state.scores[static_cast<std::size_t>(creditedWinner)] += 1;
+  } else if (state.match.mode == GameMode::TurnBased && state.match.suddenDeath) {
+    creditedWinner = 1 - playerIndex;
+    state.scores[static_cast<std::size_t>(creditedWinner)] += 1;
+  }
+
+  if (state.match.mode == GameMode::FreePlay &&
+      creditedWinner >= 0 &&
+      state.scores[static_cast<std::size_t>(creditedWinner)] >= kFreePlayTargetKills) {
+    state.match.matchOver = true;
+    state.match.winnerIndex = creditedWinner;
+  } else if (state.match.mode == GameMode::TurnBased && state.match.suddenDeath) {
+    state.match.matchOver = true;
+    state.match.winnerIndex = creditedWinner >= 0 ? creditedWinner : (1 - playerIndex);
+  }
+
+  if (state.match.matchOver) {
+    resetMining(state.players[static_cast<std::size_t>(playerIndex)]);
+    resetPlacement(state.players[static_cast<std::size_t>(playerIndex)]);
+    return;
   }
 
   PlayerState& playerState = state.players[static_cast<std::size_t>(playerIndex)];
@@ -1912,11 +1989,38 @@ void integratePlayerMovement(PlayerState& playerState, const World& world, const
 }
 
 void updateMovement(GLFWwindow* window, AppState& state, float deltaTime) {
+  static bool freePlayPressedLastFrame = false;
+  static bool turnBasedPressedLastFrame = false;
+  static bool resetPressedLastFrame = false;
+
   if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS && state.input.captureMouse) {
     toggleMouseCapture(window, state.input, false);
   }
   if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS && !state.input.captureMouse) {
     toggleMouseCapture(window, state.input, true);
+  }
+
+  const bool freePlayPressed = glfwGetKey(window, GLFW_KEY_F1) == GLFW_PRESS;
+  const bool turnBasedPressed = glfwGetKey(window, GLFW_KEY_F2) == GLFW_PRESS;
+  const bool resetPressed = glfwGetKey(window, GLFW_KEY_ENTER) == GLFW_PRESS || glfwGetKey(window, GLFW_KEY_R) == GLFW_PRESS;
+  if (freePlayPressed && !freePlayPressedLastFrame) {
+    resetMatch(state, GameMode::FreePlay);
+  }
+  if (turnBasedPressed && !turnBasedPressedLastFrame) {
+    resetMatch(state, GameMode::TurnBased);
+  }
+  if (resetPressed && !resetPressedLastFrame) {
+    resetMatch(state, state.match.mode);
+  }
+  freePlayPressedLastFrame = freePlayPressed;
+  turnBasedPressedLastFrame = turnBasedPressed;
+  resetPressedLastFrame = resetPressed;
+
+  if (state.match.matchOver) {
+    for (PlayerState& playerState : state.players) {
+      playerState.jumpHeldLastFrame = false;
+    }
+    return;
   }
 
   PlayerState& playerOne = state.players[0];
@@ -1974,17 +2078,19 @@ void updateMovement(GLFWwindow* window, AppState& state, float deltaTime) {
     const bool jumpPressed = gamepadState.buttons[GLFW_GAMEPAD_BUTTON_A] == GLFW_PRESS;
     integratePlayerMovement(playerTwo, state.world, wishDir, sprinting, jumpPressed, deltaTime);
 
-    if (gamepadState.buttons[GLFW_GAMEPAD_BUTTON_LEFT_BUMPER] == GLFW_PRESS) {
-      playerTwo.satellite.orbitYawTarget -= kSatelliteOrbitAdjustSpeed * deltaTime;
-    }
-    if (gamepadState.buttons[GLFW_GAMEPAD_BUTTON_RIGHT_BUMPER] == GLFW_PRESS) {
-      playerTwo.satellite.orbitYawTarget += kSatelliteOrbitAdjustSpeed * deltaTime;
-    }
-    if (gamepadState.buttons[GLFW_GAMEPAD_BUTTON_X] == GLFW_PRESS) {
-      playerTwo.satellite.orbitSpeedTarget -= kSatelliteOrbitSpeedAdjustRate * deltaTime;
-    }
-    if (gamepadState.buttons[GLFW_GAMEPAD_BUTTON_Y] == GLFW_PRESS) {
-      playerTwo.satellite.orbitSpeedTarget += kSatelliteOrbitSpeedAdjustRate * deltaTime;
+    if (canAttack(state)) {
+      if (gamepadState.buttons[GLFW_GAMEPAD_BUTTON_LEFT_BUMPER] == GLFW_PRESS) {
+        playerTwo.satellite.orbitYawTarget -= kSatelliteOrbitAdjustSpeed * deltaTime;
+      }
+      if (gamepadState.buttons[GLFW_GAMEPAD_BUTTON_RIGHT_BUMPER] == GLFW_PRESS) {
+        playerTwo.satellite.orbitYawTarget += kSatelliteOrbitAdjustSpeed * deltaTime;
+      }
+      if (gamepadState.buttons[GLFW_GAMEPAD_BUTTON_X] == GLFW_PRESS) {
+        playerTwo.satellite.orbitSpeedTarget -= kSatelliteOrbitSpeedAdjustRate * deltaTime;
+      }
+      if (gamepadState.buttons[GLFW_GAMEPAD_BUTTON_Y] == GLFW_PRESS) {
+        playerTwo.satellite.orbitSpeedTarget += kSatelliteOrbitSpeedAdjustRate * deltaTime;
+      }
     }
     playerTwo.satellite.orbitSpeedTarget =
         std::clamp(playerTwo.satellite.orbitSpeedTarget, kSatelliteOrbitSpeedMin, kSatelliteOrbitSpeedMax);
@@ -1997,7 +2103,7 @@ void updateMovement(GLFWwindow* window, AppState& state, float deltaTime) {
     playerTwo.jumpHeldLastFrame = false;
   }
 
-  if (state.input.captureMouse) {
+  if (state.input.captureMouse && canAttack(state)) {
     if (glfwGetKey(window, GLFW_KEY_MINUS) == GLFW_PRESS) {
       state.players[0].satellite.orbitYawTarget -= kSatelliteOrbitAdjustSpeed * deltaTime;
     }
@@ -2138,6 +2244,19 @@ void updatePlayerBlockInput(AppState& state, PlayerState& playerState, bool digP
 }
 
 void handleBlockInput(GLFWwindow* window, AppState& state, float deltaTime) {
+  if (!canMineAndBuild(state)) {
+    for (PlayerState& playerState : state.players) {
+      resetMining(playerState);
+      resetPlacement(playerState);
+    }
+    state.input.leftPressedLastFrame = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+    state.input.rightPressedLastFrame = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
+    state.players[1].blockCycleLeftLastFrame = false;
+    state.players[1].blockCycleUpLastFrame = false;
+    state.players[1].blockCycleRightLastFrame = false;
+    return;
+  }
+
   const bool leftPressed = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
   const bool rightPressed = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
   PlayerState& playerOne = state.players[0];
@@ -2182,6 +2301,11 @@ void handleBlockInput(GLFWwindow* window, AppState& state, float deltaTime) {
 }
 
 void handleAtomicBombInput(GLFWwindow* window, AppState& state) {
+  if (!canAttack(state)) {
+    state.input.atomicBombPressedLastFrame = glfwGetKey(window, GLFW_KEY_P) == GLFW_PRESS;
+    return;
+  }
+
   const bool bombPressed = glfwGetKey(window, GLFW_KEY_P) == GLFW_PRESS;
   if (state.input.captureMouse && bombPressed && !state.input.atomicBombPressedLastFrame) {
     dropAtomicBomb(state, 0);
@@ -2302,6 +2426,139 @@ void resetPlacement(PlayerState& playerState) {
   playerState.placing.type = Air;
 }
 
+bool isTurnBasedBuildPhase(const AppState& state) {
+  return state.match.mode == GameMode::TurnBased && !state.match.suddenDeath &&
+         state.match.phase == TurnPhase::Build && !state.match.matchOver;
+}
+
+bool isTurnBasedAttackPhase(const AppState& state) {
+  return state.match.mode == GameMode::TurnBased &&
+         (state.match.suddenDeath || state.match.phase == TurnPhase::Attack) &&
+         !state.match.matchOver;
+}
+
+bool canMineAndBuild(const AppState& state) {
+  if (state.match.matchOver) {
+    return false;
+  }
+  return state.match.mode == GameMode::FreePlay || isTurnBasedBuildPhase(state);
+}
+
+bool canAttack(const AppState& state) {
+  if (state.match.matchOver) {
+    return false;
+  }
+  return state.match.mode == GameMode::FreePlay || isTurnBasedAttackPhase(state);
+}
+
+bool satellitesOnline(const AppState& state) {
+  if (state.match.matchOver) {
+    return false;
+  }
+  return state.match.mode == GameMode::FreePlay || isTurnBasedAttackPhase(state);
+}
+
+void clearCombatState(AppState& state) {
+  state.atomicBomb = AtomicBombState{};
+}
+
+void initializeSatelliteState(AppState& state) {
+  state.players[0].satellite = SatelliteState{};
+  state.players[1].satellite = SatelliteState{};
+  state.players[1].satellite.orbitYaw = glm::half_pi<float>();
+  state.players[1].satellite.orbitYawTarget = glm::half_pi<float>();
+  state.players[1].satellite.orbitPhase = glm::pi<float>() * 0.75f;
+}
+
+void beginSuddenDeath(AppState& state) {
+  state.match.suddenDeath = true;
+  state.match.phase = TurnPhase::Attack;
+  state.match.roundTimeRemaining = 0.0f;
+  clearCombatState(state);
+  for (PlayerState& playerState : state.players) {
+    playerState.health = 1.0f;
+    playerState.damageFlash = 1.0f;
+    resetMining(playerState);
+    resetPlacement(playerState);
+  }
+}
+
+void advanceTurnRound(AppState& state) {
+  clearCombatState(state);
+  for (PlayerState& playerState : state.players) {
+    resetMining(playerState);
+    resetPlacement(playerState);
+  }
+
+  if (state.match.roundNumber >= kTurnBasedRounds) {
+    if (state.scores[0] != state.scores[1]) {
+      state.match.matchOver = true;
+      state.match.winnerIndex = state.scores[0] > state.scores[1] ? 0 : 1;
+    } else {
+      beginSuddenDeath(state);
+    }
+    return;
+  }
+
+  state.match.roundNumber += 1;
+  state.match.roundTimeRemaining = kTurnRoundDuration;
+  state.match.phase = (state.match.roundNumber % 2 == 1) ? TurnPhase::Build : TurnPhase::Attack;
+}
+
+void updateMatchState(AppState& state, float deltaTime) {
+  if (state.match.mode != GameMode::TurnBased || state.match.matchOver || state.match.suddenDeath) {
+    return;
+  }
+
+  state.match.roundTimeRemaining = std::max(0.0f, state.match.roundTimeRemaining - deltaTime);
+  if (state.match.roundTimeRemaining <= 0.0f) {
+    advanceTurnRound(state);
+  }
+}
+
+void resetMatch(AppState& state, GameMode mode) {
+  state.scores = {0, 0};
+  state.match = MatchState{};
+  state.match.mode = mode;
+  state.match.phase = mode == GameMode::TurnBased ? TurnPhase::Build : TurnPhase::Attack;
+  state.match.roundNumber = 1;
+  state.match.roundTimeRemaining = kTurnRoundDuration;
+  state.match.suddenDeath = false;
+  state.match.matchOver = false;
+  state.match.winnerIndex = -1;
+  state.launcherEquipped = false;
+  state.missileAim = MissileAimState{};
+  state.missile = MissileState{};
+  clearCombatState(state);
+  initializeSatelliteState(state);
+
+  for (int i = 0; i < static_cast<int>(state.players.size()); ++i) {
+    PlayerState& playerState = state.players[static_cast<std::size_t>(i)];
+    playerState.avatar.position = state.spawnPositions[static_cast<std::size_t>(i)];
+    playerState.avatar.velocity = glm::vec3(0.0f);
+    playerState.avatar.onGround = false;
+    playerState.health = kPlayerMaxHealth;
+    playerState.damageFlash = 0.0f;
+    playerState.carriedFuel = kFuelStartingCarry;
+    playerState.carriedPlutonium = 0;
+    playerState.selectedBlock = Crust;
+    playerState.jumpHeldLastFrame = false;
+    playerState.blockCycleLeftLastFrame = false;
+    playerState.blockCycleUpLastFrame = false;
+    playerState.blockCycleRightLastFrame = false;
+    playerState.hoveredBlock.reset();
+    playerState.hand = HandState{};
+    playerState.cameraFx = CameraFeedbackState{};
+    resetMining(playerState);
+    resetPlacement(playerState);
+  }
+
+  state.players[0].avatar.yaw = -90.0f;
+  state.players[0].avatar.pitch = -12.0f;
+  state.players[1].avatar.yaw = 90.0f;
+  state.players[1].avatar.pitch = -12.0f;
+}
+
 }  // namespace
 
 int main() {
@@ -2351,11 +2608,8 @@ int main() {
   state.players[1].invertedGravity = true;
   state.spawnPositions[1] = findInvertedSpawnPosition(state.world);
   state.players[1].avatar.position = state.spawnPositions[1];
-  state.players[1].avatar.yaw = 90.0f;
-  state.players[1].avatar.pitch = -12.0f;
-  state.players[1].satellite.orbitYaw = glm::half_pi<float>();
-  state.players[1].satellite.orbitYawTarget = glm::half_pi<float>();
-  state.players[1].satellite.orbitPhase = glm::pi<float>() * 0.75f;
+  initializeSatelliteState(state);
+  resetMatch(state, GameMode::FreePlay);
   markAllChunksDirty(state);
   gState = &state;
   glfwSetCursorPosCallback(window, mouseCallback);
@@ -2413,6 +2667,7 @@ int main() {
     updateCameraFeedback(state.players[1], deltaTime);
     updateAtomicBomb(state, deltaTime);
     updateSatelliteFuel(state, deltaTime);
+    updateMatchState(state, deltaTime);
     rebuildDirtyChunks(state);
 
     int width = 0;
@@ -2426,7 +2681,8 @@ int main() {
                                const glm::vec3& drawEye,
                                const glm::vec3& fogColor,
                                float exposure,
-                               float fogDensity) {
+                               float fogDensity,
+                               float contrastBoost) {
       glUseProgram(worldProgram);
       glUniformMatrix4fv(glGetUniformLocation(worldProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(identity));
       glUniformMatrix4fv(glGetUniformLocation(worldProgram, "uView"), 1, GL_FALSE, glm::value_ptr(drawView));
@@ -2437,6 +2693,7 @@ int main() {
       glUniform3f(glGetUniformLocation(worldProgram, "uFogColor"), fogColor.x, fogColor.y, fogColor.z);
       glUniform1f(glGetUniformLocation(worldProgram, "uExposure"), exposure);
       glUniform1f(glGetUniformLocation(worldProgram, "uFogDensity"), fogDensity);
+      glUniform1f(glGetUniformLocation(worldProgram, "uContrastBoost"), contrastBoost);
 
       glActiveTexture(GL_TEXTURE0);
       glBindTexture(GL_TEXTURE_2D, atlasTexture);
@@ -2472,6 +2729,7 @@ int main() {
       glUseProgram(colorProgram);
       glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uView"), 1, GL_FALSE, glm::value_ptr(drawView));
       glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uProjection"), 1, GL_FALSE, glm::value_ptr(drawProjection));
+      glUniform1f(glGetUniformLocation(colorProgram, "uAlpha"), 1.0f);
       glBindVertexArray(solidCubeVao);
       glDisable(GL_CULL_FACE);
       if (alwaysVisible) {
@@ -2481,16 +2739,16 @@ int main() {
 
       glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(forcefieldHaloModel));
       glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
-                  0.06f * fieldPulse * brightness,
-                  0.42f * fieldPulse * brightness,
-                  0.04f * fieldPulse * brightness);
+                  0.10f * fieldPulse * brightness,
+                  0.72f * fieldPulse * brightness,
+                  0.05f * fieldPulse * brightness);
       glDrawArrays(GL_TRIANGLES, 0, 36);
 
       glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(forcefieldCoreModel));
       glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
-                  0.03f * fieldPulse * brightness,
-                  0.16f * fieldPulse * brightness,
-                  0.02f * fieldPulse * brightness);
+                  0.06f * fieldPulse * brightness,
+                  0.30f * fieldPulse * brightness,
+                  0.03f * fieldPulse * brightness);
       glDrawArrays(GL_TRIANGLES, 0, 36);
 
       const glm::mat4 forcefieldSkinModel =
@@ -2499,9 +2757,9 @@ int main() {
           glm::scale(glm::mat4(1.0f), glm::vec3(fieldWidth, kForcefieldThickness * 1.44f, fieldDepth));
       glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(forcefieldSkinModel));
       glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
-                  0.22f * fieldPulse * brightness,
-                  0.95f * fieldPulse * brightness,
-                  0.12f * fieldPulse * brightness);
+                  0.30f * fieldPulse * brightness,
+                  1.40f * fieldPulse * brightness,
+                  0.10f * fieldPulse * brightness);
       glDrawArrays(GL_TRIANGLES, 0, 36);
 
       glBindVertexArray(orbitLineVao);
@@ -2523,9 +2781,9 @@ int main() {
       edgeRings[9] = edgeRings[5];
       glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(edgeRings), edgeRings.data());
       glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
-                  0.56f * fieldPulse * brightness,
-                  1.00f * fieldPulse * brightness,
-                  0.20f * fieldPulse * brightness);
+                  0.72f * fieldPulse * brightness,
+                  1.34f * fieldPulse * brightness,
+                  0.16f * fieldPulse * brightness);
       glDrawArrays(GL_LINE_STRIP, 0, 5);
       glDrawArrays(GL_LINE_STRIP, 5, 5);
 
@@ -2540,9 +2798,9 @@ int main() {
       }
       glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(scarLines), scarLines.data());
       glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
-                  0.72f * fieldPulse * brightness,
-                  1.00f * fieldPulse * brightness,
-                  0.28f * fieldPulse * brightness);
+                  0.84f * fieldPulse * brightness,
+                  1.42f * fieldPulse * brightness,
+                  0.18f * fieldPulse * brightness);
       glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(scarLines.size()));
 
       if (alwaysVisible) {
@@ -2557,6 +2815,7 @@ int main() {
       glUseProgram(colorProgram);
       glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uView"), 1, GL_FALSE, glm::value_ptr(drawView));
       glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uProjection"), 1, GL_FALSE, glm::value_ptr(drawProjection));
+      glUniform1f(glGetUniformLocation(colorProgram, "uAlpha"), 1.0f);
       glBindVertexArray(solidCubeVao);
 
       if (state.atomicBomb.active || state.atomicBomb.bouncing) {
@@ -2749,6 +3008,37 @@ int main() {
         glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(headModel));
         glUniform3f(glGetUniformLocation(colorProgram, "uColor"), 0.86f, 0.68f, 0.56f);
         glDrawArrays(GL_TRIANGLES, 0, 36);
+
+        const glm::vec3 headLightColor =
+            playerIndex == 0 ? glm::vec3(1.00f, 0.48f, 0.18f) : glm::vec3(0.34f, 0.82f, 1.00f);
+        const glm::vec3 headLightGlow =
+            playerIndex == 0 ? glm::vec3(1.00f, 0.78f, 0.36f) : glm::vec3(0.62f, 0.92f, 1.00f);
+        const float headLightDirection = inverted ? -1.0f : 1.0f;
+        const glm::vec3 headLightCenter =
+            player.position +
+            glm::vec3(0.0f, headLightDirection * 1.46f * kBlockSize, 0.0f);
+
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+        const float haloScale = 4.2f * kBlockSize;
+        const glm::mat4 haloModel =
+            glm::translate(glm::mat4(1.0f), headLightCenter - glm::vec3(haloScale * 0.5f)) *
+            glm::scale(glm::mat4(1.0f), glm::vec3(haloScale));
+        glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(haloModel));
+        glUniform1f(glGetUniformLocation(colorProgram, "uAlpha"), 0.5f);
+        glUniform3f(glGetUniformLocation(colorProgram, "uColor"), headLightGlow.x, headLightGlow.y, headLightGlow.z);
+        glDrawArrays(GL_TRIANGLES, 0, 36);
+
+        const float coreScale = 2.2f * kBlockSize;
+        const glm::mat4 coreModel =
+            glm::translate(glm::mat4(1.0f), headLightCenter - glm::vec3(coreScale * 0.5f)) *
+            glm::scale(glm::mat4(1.0f), glm::vec3(coreScale));
+        glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(coreModel));
+        glUniform3f(glGetUniformLocation(colorProgram, "uColor"), headLightColor.x, headLightColor.y, headLightColor.z);
+        glDrawArrays(GL_TRIANGLES, 0, 36);
+        glUniform1f(glGetUniformLocation(colorProgram, "uAlpha"), 1.0f);
+        glDisable(GL_BLEND);
       }
     };
 
@@ -2765,6 +3055,15 @@ int main() {
       glDisable(GL_DEPTH_TEST);
       glUseProgram(skyProgram);
       glUniform1f(glGetUniformLocation(skyProgram, "uTime"), currentFrame);
+      if (playerState.invertedGravity) {
+        glUniform3f(glGetUniformLocation(skyProgram, "uTopTint"), 0.00f, 0.02f, 0.08f);
+        glUniform3f(glGetUniformLocation(skyProgram, "uHorizonTint"), 0.10f, 0.24f, 0.56f);
+        glUniform3f(glGetUniformLocation(skyProgram, "uPitTint"), 0.00f, 0.00f, 0.02f);
+      } else {
+        glUniform3f(glGetUniformLocation(skyProgram, "uTopTint"), 0.18f, 0.03f, 0.02f);
+        glUniform3f(glGetUniformLocation(skyProgram, "uHorizonTint"), 0.58f, 0.16f, 0.08f);
+        glUniform3f(glGetUniformLocation(skyProgram, "uPitTint"), 0.03f, 0.00f, 0.00f);
+      }
       glBindVertexArray(skyVao);
       glDrawArrays(GL_TRIANGLES, 0, 3);
       glEnable(GL_DEPTH_TEST);
@@ -2784,16 +3083,24 @@ int main() {
       const glm::mat4 view =
           glm::lookAt(eye, eye + cameraFront(playerState.avatar), viewUpVector(playerState));
 
-      drawWorld(view, projection, eye, glm::vec3(0.23f, 0.05f, 0.04f), 1.0f, 0.013f);
+      const glm::vec3 fogColor =
+          playerState.invertedGravity ? glm::vec3(0.02f, 0.06f, 0.18f) : glm::vec3(0.23f, 0.05f, 0.04f);
+      const float exposure = playerState.invertedGravity ? 2.15f : 1.0f;
+      const float fogDensity = playerState.invertedGravity ? 0.0046f : 0.013f;
+
+      const float contrastBoost = playerState.invertedGravity ? 1.08f : 1.0f;
+      drawWorld(view, projection, eye, fogColor, exposure, fogDensity, contrastBoost);
       drawForcefield(view, projection, 1.0f, false);
       drawAtomicBomb(view, projection);
       drawPlayerBodies(playerIndex, view, projection);
       const float blinkPhase = std::sin((currentFrame / kSatelliteBlinkPeriod) * glm::two_pi<float>()) * 0.5f + 0.5f;
+      const float satelliteVisualBrightness = satellitesOnline(state) ? 1.0f : 0.10f;
 
       glUseProgram(colorProgram);
       glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uView"), 1, GL_FALSE, glm::value_ptr(view));
       glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uProjection"), 1, GL_FALSE, glm::value_ptr(projection));
       glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(identity));
+      glUniform1f(glGetUniformLocation(colorProgram, "uAlpha"), 1.0f);
       glBindVertexArray(orbitLineVao);
       glBindBuffer(GL_ARRAY_BUFFER, orbitLineVbo);
       glDisable(GL_CULL_FACE);
@@ -2814,12 +3121,14 @@ int main() {
         }
         glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(glm::vec3) * orbitPoints.size(), orbitPoints.data());
         glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
-                    pathColor.x * 0.55f, pathColor.y * 0.55f, pathColor.z * 0.55f);
+                    pathColor.x * 0.55f * satelliteVisualBrightness,
+                    pathColor.y * 0.55f * satelliteVisualBrightness,
+                    pathColor.z * 0.55f * satelliteVisualBrightness);
         glDrawArrays(GL_LINE_STRIP, 0, static_cast<GLsizei>(orbitPoints.size()));
         glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
-                    std::min(1.0f, pathColor.x * 1.15f),
-                    std::min(1.0f, pathColor.y * 1.15f),
-                    std::min(1.0f, pathColor.z * 1.15f));
+                    std::min(1.0f, pathColor.x * 1.15f) * satelliteVisualBrightness,
+                    std::min(1.0f, pathColor.y * 1.15f) * satelliteVisualBrightness,
+                    std::min(1.0f, pathColor.z * 1.15f) * satelliteVisualBrightness);
         glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(orbitPoints.size()));
 
         const glm::vec3 satellitePos =
@@ -2849,7 +3158,9 @@ int main() {
             glm::scale(glm::mat4(1.0f), glm::vec3(kSatelliteSize * (2.40f + blinkPhase * 0.34f)));
         glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(haloModel));
         glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
-                    glowColor.x * 0.54f, glowColor.y * 0.54f, glowColor.z * 0.54f);
+                    glowColor.x * 0.54f * satelliteVisualBrightness,
+                    glowColor.y * 0.54f * satelliteVisualBrightness,
+                    glowColor.z * 0.54f * satelliteVisualBrightness);
         glDrawArrays(GL_TRIANGLES, 0, 36);
 
         const glm::mat4 haloCoreModel =
@@ -2857,12 +3168,16 @@ int main() {
             glm::scale(glm::mat4(1.0f), glm::vec3(kSatelliteSize * (1.76f + blinkPhase * 0.28f)));
         glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(haloCoreModel));
         glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
-                    glowColor.x * 0.78f, glowColor.y * 0.78f, glowColor.z * 0.78f);
+                    glowColor.x * 0.78f * satelliteVisualBrightness,
+                    glowColor.y * 0.78f * satelliteVisualBrightness,
+                    glowColor.z * 0.78f * satelliteVisualBrightness);
         glDrawArrays(GL_TRIANGLES, 0, 36);
 
         glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(satelliteModel));
         glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
-                    bodyColor.x + blinkPhase * 0.18f, bodyColor.y + blinkPhase * 0.16f, bodyColor.z);
+                    (bodyColor.x + blinkPhase * 0.18f) * satelliteVisualBrightness,
+                    (bodyColor.y + blinkPhase * 0.16f) * satelliteVisualBrightness,
+                    bodyColor.z * satelliteVisualBrightness);
         glDrawArrays(GL_TRIANGLES, 0, 36);
 
         const glm::mat4 coreModel =
@@ -2870,9 +3185,9 @@ int main() {
             glm::scale(glm::mat4(1.0f), glm::vec3(kSatelliteSize * 0.68f));
         glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(coreModel));
         glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
-                    std::min(1.0f, glowColor.x + 0.22f),
-                    std::min(1.0f, glowColor.y + 0.16f),
-                    std::min(1.0f, glowColor.z + 0.10f));
+                    std::min(1.0f, glowColor.x + 0.22f) * satelliteVisualBrightness,
+                    std::min(1.0f, glowColor.y + 0.16f) * satelliteVisualBrightness,
+                    std::min(1.0f, glowColor.z + 0.10f) * satelliteVisualBrightness);
         glDrawArrays(GL_TRIANGLES, 0, 36);
 
         const glm::mat4 leftWingModel =
@@ -2880,7 +3195,9 @@ int main() {
             glm::scale(glm::mat4(1.0f), glm::vec3(kSatelliteSize * 1.44f, kSatelliteSize * 0.30f, kSatelliteSize * 1.44f));
         glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(leftWingModel));
         glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
-                    bodyColor.x * 0.75f, bodyColor.y * 0.75f, bodyColor.z * 0.82f);
+                    bodyColor.x * 0.75f * satelliteVisualBrightness,
+                    bodyColor.y * 0.75f * satelliteVisualBrightness,
+                    bodyColor.z * 0.82f * satelliteVisualBrightness);
         glDrawArrays(GL_TRIANGLES, 0, 36);
 
         const glm::mat4 rightWingModel =
@@ -2888,7 +3205,9 @@ int main() {
             glm::scale(glm::mat4(1.0f), glm::vec3(kSatelliteSize * 1.44f, kSatelliteSize * 0.30f, kSatelliteSize * 1.44f));
         glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(rightWingModel));
         glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
-                    bodyColor.x * 0.75f, bodyColor.y * 0.75f, bodyColor.z * 0.82f);
+                    bodyColor.x * 0.75f * satelliteVisualBrightness,
+                    bodyColor.y * 0.75f * satelliteVisualBrightness,
+                    bodyColor.z * 0.82f * satelliteVisualBrightness);
         glDrawArrays(GL_TRIANGLES, 0, 36);
 
         const glm::mat4 prowModel =
@@ -2896,7 +3215,9 @@ int main() {
             glm::scale(glm::mat4(1.0f), glm::vec3(kSatelliteSize * 0.80f));
         glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(prowModel));
         glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
-                    std::min(1.0f, beaconColor.x), std::min(1.0f, beaconColor.y), std::min(1.0f, beaconColor.z));
+                    std::min(1.0f, beaconColor.x) * satelliteVisualBrightness,
+                    std::min(1.0f, beaconColor.y) * satelliteVisualBrightness,
+                    std::min(1.0f, beaconColor.z) * satelliteVisualBrightness);
         glDrawArrays(GL_TRIANGLES, 0, 36);
 
         const glm::mat4 aftModel =
@@ -2904,7 +3225,9 @@ int main() {
             glm::scale(glm::mat4(1.0f), glm::vec3(kSatelliteSize * 0.64f));
         glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(aftModel));
         glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
-                    glowColor.x * 0.92f, glowColor.y * 0.92f, glowColor.z * 0.92f);
+                    glowColor.x * 0.92f * satelliteVisualBrightness,
+                    glowColor.y * 0.92f * satelliteVisualBrightness,
+                    glowColor.z * 0.92f * satelliteVisualBrightness);
         glDrawArrays(GL_TRIANGLES, 0, 36);
 
         const glm::vec3 beaconOffset(0.22f * kBlockSize, 0.22f * kBlockSize, 0.0f);
@@ -2912,41 +3235,46 @@ int main() {
             glm::translate(glm::mat4(1.0f), satellitePos + beaconOffset - glm::vec3(kSatelliteBeaconSize * 0.5f)) *
             glm::scale(glm::mat4(1.0f), glm::vec3(kSatelliteBeaconSize * (0.75f + blinkPhase * 0.65f)));
         glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(beaconModel));
-        glUniform3f(glGetUniformLocation(colorProgram, "uColor"), beaconColor.x, beaconColor.y, beaconColor.z);
+        glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
+                    beaconColor.x * satelliteVisualBrightness,
+                    beaconColor.y * satelliteVisualBrightness,
+                    beaconColor.z * satelliteVisualBrightness);
         glDrawArrays(GL_TRIANGLES, 0, 36);
 
-        const int trailPips = 20;
-        for (int pip = 0; pip < trailPips; ++pip) {
-          const float behind = static_cast<float>(pip) / static_cast<float>(trailPips - 1);
-          float pipAngle = satellite.orbitPhase - behind * 0.58f * glm::two_pi<float>();
-          if (pipAngle < 0.0f) {
-            pipAngle += glm::two_pi<float>();
-          }
-          const glm::vec3 pipPos = satellitePositionAtAngle(pipAngle, satellite.orbitYaw, satellite.orbitSpeed);
-          const glm::vec3 pipNormal = glm::normalize(pipPos - worldCenter());
-          glm::vec3 pipTangent = satelliteTangentAtAngle(pipAngle, satellite.orbitYaw, satellite.orbitSpeed);
-          pipTangent = glm::normalize(pipTangent - pipNormal * glm::dot(pipTangent, pipNormal));
-          const float pipScale = kSatelliteBeaconSize * (1.35f - behind * 0.72f) * (1.0f + blinkPhase * 0.24f);
-          const glm::mat4 pipModel =
-              glm::translate(glm::mat4(1.0f), pipPos - pipTangent * (behind * 0.16f * kBlockSize) - glm::vec3(pipScale * 0.5f)) *
-              glm::scale(glm::mat4(1.0f), glm::vec3(pipScale));
-          glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(pipModel));
-          glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
-                      glowColor.x * (1.0f - behind * 0.42f),
-                      glowColor.y * (1.0f - behind * 0.42f),
-                      glowColor.z * (1.0f - behind * 0.42f));
-          glDrawArrays(GL_TRIANGLES, 0, 36);
+        if (satellitesOnline(state)) {
+          const int trailPips = 20;
+          for (int pip = 0; pip < trailPips; ++pip) {
+            const float behind = static_cast<float>(pip) / static_cast<float>(trailPips - 1);
+            float pipAngle = satellite.orbitPhase - behind * 0.58f * glm::two_pi<float>();
+            if (pipAngle < 0.0f) {
+              pipAngle += glm::two_pi<float>();
+            }
+            const glm::vec3 pipPos = satellitePositionAtAngle(pipAngle, satellite.orbitYaw, satellite.orbitSpeed);
+            const glm::vec3 pipNormal = glm::normalize(pipPos - worldCenter());
+            glm::vec3 pipTangent = satelliteTangentAtAngle(pipAngle, satellite.orbitYaw, satellite.orbitSpeed);
+            pipTangent = glm::normalize(pipTangent - pipNormal * glm::dot(pipTangent, pipNormal));
+            const float pipScale = kSatelliteBeaconSize * (1.35f - behind * 0.72f) * (1.0f + blinkPhase * 0.24f);
+            const glm::mat4 pipModel =
+                glm::translate(glm::mat4(1.0f), pipPos - pipTangent * (behind * 0.16f * kBlockSize) - glm::vec3(pipScale * 0.5f)) *
+                glm::scale(glm::mat4(1.0f), glm::vec3(pipScale));
+            glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(pipModel));
+            glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
+                        glowColor.x * (1.0f - behind * 0.42f),
+                        glowColor.y * (1.0f - behind * 0.42f),
+                        glowColor.z * (1.0f - behind * 0.42f));
+            glDrawArrays(GL_TRIANGLES, 0, 36);
 
-          const glm::vec3 sideGlowOffset = orbitBinormal * (std::sin((behind + blinkPhase) * glm::two_pi<float>() * 2.0f) * 0.22f * kBlockSize);
-          const glm::mat4 sideGlowModel =
-              glm::translate(glm::mat4(1.0f), pipPos + sideGlowOffset - glm::vec3(pipScale * 0.34f)) *
-              glm::scale(glm::mat4(1.0f), glm::vec3(pipScale * 0.68f));
-          glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(sideGlowModel));
-          glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
-                      glowColor.x * (0.78f - behind * 0.38f),
-                      glowColor.y * (0.78f - behind * 0.38f),
-                      glowColor.z * (0.78f - behind * 0.38f));
-          glDrawArrays(GL_TRIANGLES, 0, 36);
+            const glm::vec3 sideGlowOffset = orbitBinormal * (std::sin((behind + blinkPhase) * glm::two_pi<float>() * 2.0f) * 0.22f * kBlockSize);
+            const glm::mat4 sideGlowModel =
+                glm::translate(glm::mat4(1.0f), pipPos + sideGlowOffset - glm::vec3(pipScale * 0.34f)) *
+                glm::scale(glm::mat4(1.0f), glm::vec3(pipScale * 0.68f));
+            glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(sideGlowModel));
+            glUniform3f(glGetUniformLocation(colorProgram, "uColor"),
+                        glowColor.x * (0.78f - behind * 0.38f),
+                        glowColor.y * (0.78f - behind * 0.38f),
+                        glowColor.z * (0.78f - behind * 0.38f));
+            glDrawArrays(GL_TRIANGLES, 0, 36);
+          }
         }
       }
       glEnable(GL_CULL_FACE);
@@ -2977,10 +3305,10 @@ int main() {
       glScissor(miniX, miniY, miniSize, miniSize);
       glClearColor(0.035f, 0.01f, 0.01f, 1.0f);
       glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-      const bool satelliteFueled = playerState.carriedFuel > 0.001f;
+      const bool satelliteFueled = satellitesOnline(state) && playerState.carriedFuel > 0.001f;
       if (satelliteFueled) {
-        drawWorld(miniView, miniProjection, satellitePos, glm::vec3(0.12f, 0.03f, 0.03f), 1.55f, 0.005f);
-        drawForcefield(miniView, miniProjection, 0.28f, false);
+        drawWorld(miniView, miniProjection, satellitePos, glm::vec3(0.12f, 0.03f, 0.03f), 1.55f, 0.005f, 1.0f);
+        drawForcefield(miniView, miniProjection, 0.72f, false);
         drawAtomicBomb(miniView, miniProjection);
         drawPlayerBodies(playerIndex, miniView, miniProjection);
       }
@@ -2989,6 +3317,7 @@ int main() {
       glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uView"), 1, GL_FALSE, glm::value_ptr(identity));
       glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uProjection"), 1, GL_FALSE, glm::value_ptr(identity));
       glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(identity));
+      glUniform1f(glGetUniformLocation(colorProgram, "uAlpha"), 1.0f);
       glBindVertexArray(orbitLineVao);
       glBindBuffer(GL_ARRAY_BUFFER, orbitLineVbo);
       glDisable(GL_CULL_FACE);
@@ -3246,6 +3575,7 @@ int main() {
       glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uView"), 1, GL_FALSE, glm::value_ptr(identity));
       glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uProjection"), 1, GL_FALSE, glm::value_ptr(identity));
       glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(identity));
+      glUniform1f(glGetUniformLocation(colorProgram, "uAlpha"), 1.0f);
       glBindVertexArray(orbitLineVao);
       glBindBuffer(GL_ARRAY_BUFFER, orbitLineVbo);
       glDisable(GL_DEPTH_TEST);
@@ -3366,6 +3696,19 @@ int main() {
       addScoreNumber(state.scores[0], scoreCursor, scoreY, scoreDigitW, scoreDigitH, scoreSpacing);
       scoreCursor += 0.05f;
       addScoreNumber(state.scores[1], scoreCursor, scoreY, scoreDigitW, scoreDigitH, scoreSpacing);
+      if (state.match.mode == GameMode::TurnBased) {
+        scoreCursor += 0.09f;
+        addScoreNumber(state.match.roundNumber, scoreCursor, scoreY, scoreDigitW * 0.85f, scoreDigitH * 0.85f,
+                       scoreSpacing * 0.85f);
+        addScoreLine(glm::vec2(scoreCursor + 0.01f, scoreY - scoreDigitH * 0.85f),
+                     glm::vec2(scoreCursor + 0.06f, scoreY));
+        scoreCursor += 0.085f;
+        addScoreNumber(kTurnBasedRounds, scoreCursor, scoreY, scoreDigitW * 0.85f, scoreDigitH * 0.85f,
+                       scoreSpacing * 0.85f);
+        scoreCursor += 0.08f;
+        addScoreNumber(static_cast<int>(std::ceil(state.match.roundTimeRemaining)), scoreCursor, scoreY,
+                       scoreDigitW * 0.85f, scoreDigitH * 0.85f, scoreSpacing * 0.85f);
+      }
       if (!scoreLines.empty()) {
         glBufferSubData(GL_ARRAY_BUFFER, 0,
                         static_cast<GLsizeiptr>(scoreLines.size() * sizeof(glm::vec3)),
@@ -3392,6 +3735,7 @@ int main() {
       glUseProgram(colorProgram);
       glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uView"), 1, GL_FALSE, glm::value_ptr(handView));
       glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uProjection"), 1, GL_FALSE, glm::value_ptr(handProjection));
+      glUniform1f(glGetUniformLocation(colorProgram, "uAlpha"), 1.0f);
       glBindVertexArray(solidCubeVao);
       glDisable(GL_DEPTH_TEST);
       glDepthMask(GL_FALSE);

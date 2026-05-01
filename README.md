@@ -33,6 +33,9 @@ cd /Users/user/Documents/InterPlanetary3D
 
 ## Controls
 
+- `F1`: switch to free-play mode
+- `F2`: switch to turn-based mode
+- `Enter` or `R`: reset the current match
 - `W A S D`: move
 - `Space`: jump
 - `Left Shift`: sprint
@@ -60,3 +63,10 @@ Player 2 uses a control pad on the right screen:
 Break glowing cyan fuel blocks to refill the satellite feed. Break toxic-yellow plutonium blocks to stockpile bomb material. Each atomic bomb costs `2` plutonium. When fuel runs out, the satellite camera collapses into static.
 Nearby atomic blasts hurt, and touching the forcefield is instantly fatal.
 Regular blocks are faster to build. Hard blocks take three times as long to build, take twice as long to dig through, and provide roughly twice the blast shielding.
+
+## Match Modes
+
+- `Free-play`: current sandbox combat mode. First to `3` kills wins.
+- `Turn-based`: round `1` is build/mine only, round `2` is attack/hide, then it alternates every `60` seconds.
+- In turn-based build rounds, satellites are dark and attacks are disabled.
+- After `10` rounds, the higher score wins. Ties go to sudden death, with both players dropped to `1` health.
