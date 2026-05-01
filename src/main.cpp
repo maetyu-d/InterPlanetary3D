@@ -2026,24 +2026,17 @@ void updateMovement(GLFWwindow* window, AppState& state, float deltaTime) {
     const bool rightPressed = glfwGetKey(window, GLFW_KEY_RIGHT) == GLFW_PRESS || glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS;
     const bool acceptPressed = glfwGetKey(window, GLFW_KEY_ENTER) == GLFW_PRESS || glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS;
 
-    if (upPressed && !titleUpPressedLastFrame) {
-      int selection = static_cast<int>(state.titleSelection);
-      selection = (selection + 3) % 4;
-      state.titleSelection = static_cast<TitleSelection>(selection);
+    if (state.titleSelection != TitleSelection::FreePlay && state.titleSelection != TitleSelection::TurnBased) {
+      state.titleSelection = TitleSelection::FreePlay;
     }
-    if (downPressed && !titleDownPressedLastFrame) {
-      int selection = static_cast<int>(state.titleSelection);
-      selection = (selection + 1) % 4;
-      state.titleSelection = static_cast<TitleSelection>(selection);
-    }
-
-    if ((leftPressed && !titleLeftPressedLastFrame) || (rightPressed && !titleRightPressedLastFrame)) {
-      const int direction = (rightPressed && !titleRightPressedLastFrame) ? 1 : -1;
-      if (state.titleSelection == TitleSelection::P2Sensitivity) {
-        state.p2Controls.sensitivityIndex = std::clamp(state.p2Controls.sensitivityIndex + direction, 0, 2);
-      } else if (state.titleSelection == TitleSelection::P2Invert) {
-        state.p2Controls.invertLook = !state.p2Controls.invertLook;
-      }
+    const bool switchMode = (upPressed && !titleUpPressedLastFrame) ||
+                            (downPressed && !titleDownPressedLastFrame) ||
+                            (leftPressed && !titleLeftPressedLastFrame) ||
+                            (rightPressed && !titleRightPressedLastFrame);
+    if (switchMode) {
+      state.titleSelection = state.titleSelection == TitleSelection::FreePlay
+                                 ? TitleSelection::TurnBased
+                                 : TitleSelection::FreePlay;
     }
 
     if (acceptPressed && !titleAcceptPressedLastFrame) {
@@ -2051,10 +2044,6 @@ void updateMovement(GLFWwindow* window, AppState& state, float deltaTime) {
         startMatch(window, state, GameMode::FreePlay);
       } else if (state.titleSelection == TitleSelection::TurnBased) {
         startMatch(window, state, GameMode::TurnBased);
-      } else if (state.titleSelection == TitleSelection::P2Sensitivity) {
-        state.p2Controls.sensitivityIndex = (state.p2Controls.sensitivityIndex + 1) % 3;
-      } else if (state.titleSelection == TitleSelection::P2Invert) {
-        state.p2Controls.invertLook = !state.p2Controls.invertLook;
       }
     }
 
@@ -2819,6 +2808,7 @@ int main() {
         const glm::mat4 model =
             glm::translate(glm::mat4(1.0f), glm::vec3(x, y, 0.0f)) *
             glm::scale(glm::mat4(1.0f), glm::vec3(w, h, 0.01f));
+        glBindVertexArray(solidCubeVao);
         glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(model));
         glUniform3f(glGetUniformLocation(colorProgram, "uColor"), color.x, color.y, color.z);
         glDrawArrays(GL_TRIANGLES, 0, 36);
@@ -2826,9 +2816,6 @@ int main() {
 
       drawPanel(-1.0f, -1.0f, 1.0f, 2.0f, glm::vec3(0.18f, 0.03f, 0.02f));
       drawPanel(0.0f, -1.0f, 1.0f, 2.0f, glm::vec3(0.02f, 0.06f, 0.18f));
-      drawPanel(-0.015f, -1.0f, 0.03f, 2.0f, glm::vec3(0.16f, 0.74f, 0.10f));
-      drawPanel(-0.78f, 0.60f, 1.56f, 0.26f, glm::vec3(0.06f, 0.01f, 0.01f));
-      drawPanel(-0.64f, 0.66f, 1.28f, 0.11f, glm::vec3(0.10f, 0.02f, 0.02f));
 
       const auto drawFrame = [&](float left, float top, float right, float bottom, const glm::vec3& color) {
         const std::array<glm::vec3, 5> frame = {
@@ -2883,6 +2870,10 @@ int main() {
         };
 
         switch (glyph) {
+          case 'B':
+            add(bl, tl); add(tl, tr); add(tr, mr); add(mr, mc); add(mc, ml); add(mc, br); add(br, bc); add(bc, bl); break;
+          case 'C':
+            add(tr, tl); add(tl, bl); add(bl, br); break;
           case 'A':
             add(bl, tl); add(tl, tr); add(tr, br); add(ml, mr); break;
           case 'D':
@@ -2891,8 +2882,14 @@ int main() {
             add(bl, tl); add(tl, tr); add(ml, mr); add(bl, br); break;
           case 'F':
             add(bl, tl); add(tl, tr); add(ml, mr); break;
+          case 'G':
+            add(tr, tl); add(tl, bl); add(bl, br); add(br, mr); add(mr, mc); break;
+          case 'H':
+            add(tl, bl); add(tr, br); add(ml, mr); break;
           case 'I':
             add(tl, tr); add(tc, bc); add(bl, br); break;
+          case 'K':
+            add(tl, bl); add(mc, tr); add(mc, br); break;
           case 'L':
             add(tl, bl); add(bl, br); break;
           case 'M':
@@ -2958,113 +2955,38 @@ int main() {
       };
 
       const auto drawSelectedCard = [&](float x, float y, float w, float h, bool selected, const glm::vec3& baseColor) {
-        const glm::vec3 fill = selected ? baseColor : baseColor * 0.55f;
+        const glm::vec3 fill = selected ? baseColor : baseColor * 0.34f;
         drawPanel(x, y, w, h, fill);
-        drawFrame(x, y + h, x + w, y, selected ? glm::vec3(1.0f, 0.92f, 0.64f) : glm::vec3(0.46f, 0.22f, 0.18f));
+        drawFrame(x, y + h, x + w, y, selected ? glm::vec3(1.0f, 0.92f, 0.64f) : glm::vec3(0.28f, 0.16f, 0.18f));
       };
-
-      drawSelectedCard(-0.84f, 0.12f, 0.72f, 0.30f,
-                       titleSelectionEquals(state, TitleSelection::FreePlay),
-                       glm::vec3(0.22f, 0.05f, 0.03f));
-      drawSelectedCard(0.12f, 0.12f, 0.72f, 0.30f,
-                       titleSelectionEquals(state, TitleSelection::TurnBased),
-                       glm::vec3(0.06f, 0.04f, 0.11f));
-      drawSelectedCard(-0.84f, -0.38f, 0.72f, 0.22f,
-                       titleSelectionEquals(state, TitleSelection::P2Sensitivity),
-                       glm::vec3(0.04f, 0.05f, 0.08f));
-      drawSelectedCard(0.12f, -0.38f, 0.72f, 0.22f,
-                       titleSelectionEquals(state, TitleSelection::P2Invert),
-                       glm::vec3(0.04f, 0.05f, 0.08f));
 
       std::vector<glm::vec3> lines;
       lines.reserve(2048);
 
-      drawWord("INTERPLANETARY3D", -0.60f, 0.81f, 0.052f, 0.11f, 0.015f, lines);
-      flushLines(lines, glm::vec3(1.0f, 0.95f, 0.80f));
+      drawSelectedCard(-0.70f, -0.18f, 0.56f, 0.28f,
+                       titleSelectionEquals(state, TitleSelection::FreePlay),
+                       glm::vec3(0.18f, 0.035f, 0.025f));
+      drawSelectedCard(0.14f, -0.18f, 0.56f, 0.28f,
+                       titleSelectionEquals(state, TitleSelection::TurnBased),
+                       glm::vec3(0.025f, 0.045f, 0.13f));
+
+      drawWord("INTERPLANETARY", -0.43f, 0.58f, 0.032f, 0.070f, 0.008f, lines);
+      drawWord("3D", 0.40f, 0.58f, 0.032f, 0.070f, 0.008f, lines);
+      flushLines(lines, glm::vec3(0.98f, 0.95f, 0.84f));
+      lines.clear();
+      drawWord("MATD SPACE", -0.078f, 0.46f, 0.012f, 0.023f, 0.004f, lines);
+      flushLines(lines, glm::vec3(0.70f, 0.80f, 0.90f));
       lines.clear();
 
-      drawWord("BY MATD SPACE", -0.23f, 0.70f, 0.022f, 0.045f, 0.008f, lines);
-      flushLines(lines, glm::vec3(0.74f, 0.84f, 0.92f));
-      lines.clear();
-
-      drawWord("FREE PLAY", -0.77f, 0.42f, 0.040f, 0.07f, 0.012f, lines);
+      drawWord("FREE PLAY", -0.58f, 0.00f, 0.023f, 0.042f, 0.006f, lines);
+      drawWord("FIRST TO 3", -0.56f, -0.095f, 0.013f, 0.024f, 0.004f, lines);
       flushLines(lines, glm::vec3(0.98f, 0.86f, 0.38f));
       lines.clear();
 
-      drawWord("TURN MODE", 0.18f, 0.42f, 0.040f, 0.07f, 0.012f, lines);
-      flushLines(lines, glm::vec3(0.80f, 0.90f, 1.0f));
-      lines.clear();
-
-      drawWord("P2 LOOK SPEED", -0.77f, -0.17f, 0.030f, 0.055f, 0.010f, lines);
-      flushLines(lines, glm::vec3(0.78f, 0.88f, 0.98f));
-      lines.clear();
-
-      drawWord("P2 Y INVERT", 0.18f, -0.17f, 0.030f, 0.055f, 0.010f, lines);
-      flushLines(lines, glm::vec3(0.78f, 0.88f, 0.98f));
-      lines.clear();
-
-      drawDigitLines(3, -0.74f, 0.36f, 0.10f, 0.16f, lines);
-      flushLines(lines, glm::vec3(1.0f, 0.84f, 0.34f));
-      lines.clear();
-      const std::array<glm::vec3, 8> freeCrosshair = {
-          glm::vec3(-0.46f, 0.27f, 0.0f), glm::vec3(-0.30f, 0.27f, 0.0f),
-          glm::vec3(-0.38f, 0.19f, 0.0f), glm::vec3(-0.38f, 0.35f, 0.0f),
-          glm::vec3(-0.49f, 0.27f, 0.0f), glm::vec3(-0.43f, 0.27f, 0.0f),
-          glm::vec3(-0.33f, 0.27f, 0.0f), glm::vec3(-0.27f, 0.27f, 0.0f),
-      };
-      glBindVertexArray(orbitLineVao);
-      glBindBuffer(GL_ARRAY_BUFFER, orbitLineVbo);
-      glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(freeCrosshair), freeCrosshair.data());
-      glUniform3f(glGetUniformLocation(colorProgram, "uColor"), 1.0f, 0.72f, 0.28f);
-      glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(freeCrosshair.size()));
-
-      drawDigitLines(1, 0.22f, 0.36f, 0.08f, 0.14f, lines);
-      drawDigitLines(0, 0.33f, 0.36f, 0.08f, 0.14f, lines);
-      lines.push_back(glm::vec3(0.44f, 0.22f, 0.0f));
-      lines.push_back(glm::vec3(0.49f, 0.36f, 0.0f));
-      drawDigitLines(6, 0.54f, 0.36f, 0.08f, 0.14f, lines);
-      drawDigitLines(0, 0.65f, 0.36f, 0.08f, 0.14f, lines);
+      drawWord("TURN MODE", 0.25f, 0.00f, 0.023f, 0.042f, 0.006f, lines);
+      drawWord("10 ROUNDS", 0.29f, -0.095f, 0.013f, 0.024f, 0.004f, lines);
       flushLines(lines, glm::vec3(0.82f, 0.92f, 1.0f));
       lines.clear();
-
-      for (int i = 0; i < 5; ++i) {
-        drawPanel(0.22f + i * 0.10f, 0.17f + ((i % 2) ? 0.03f : 0.0f), 0.06f, 0.05f,
-                  i % 2 == 0 ? glm::vec3(0.54f, 0.18f, 0.08f) : glm::vec3(0.20f, 0.46f, 0.90f));
-      }
-
-      for (int i = 0; i < 3; ++i) {
-        const bool lit = i <= state.p2Controls.sensitivityIndex;
-        drawPanel(-0.76f + i * 0.14f, -0.31f, 0.08f, 0.11f + i * 0.03f,
-                  lit ? glm::vec3(0.66f, 0.86f, 1.0f) : glm::vec3(0.12f, 0.16f, 0.22f));
-      }
-      drawWord("SLOW", -0.78f, -0.34f, 0.020f, 0.040f, 0.008f, lines);
-      drawWord("MID", -0.63f, -0.34f, 0.020f, 0.040f, 0.008f, lines);
-      drawWord("FAST", -0.48f, -0.34f, 0.020f, 0.040f, 0.008f, lines);
-      flushLines(lines, glm::vec3(0.72f, 0.82f, 0.94f));
-      lines.clear();
-
-      const glm::vec3 invertColor = state.p2Controls.invertLook ? glm::vec3(0.66f, 0.96f, 0.74f)
-                                                                : glm::vec3(0.34f, 0.42f, 0.50f);
-      const std::array<glm::vec3, 8> invertIcon = {
-          glm::vec3(0.24f, -0.22f, 0.0f), glm::vec3(0.42f, -0.22f, 0.0f),
-          glm::vec3(0.42f, -0.22f, 0.0f), glm::vec3(0.36f, -0.16f, 0.0f),
-          glm::vec3(0.42f, -0.22f, 0.0f), glm::vec3(0.36f, -0.28f, 0.0f),
-          glm::vec3(0.54f, -0.16f, 0.0f), glm::vec3(0.54f, -0.32f, 0.0f),
-      };
-      glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(invertIcon), invertIcon.data());
-      glUniform3f(glGetUniformLocation(colorProgram, "uColor"), invertColor.x, invertColor.y, invertColor.z);
-      glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(invertIcon.size()));
-      drawWord(state.p2Controls.invertLook ? "ON" : "OFF", 0.60f, -0.23f, 0.030f, 0.060f, 0.010f, lines);
-      flushLines(lines, invertColor);
-      lines.clear();
-
-      drawWord("ARROWS CHANGE", -0.42f, -0.62f, 0.022f, 0.040f, 0.008f, lines);
-      drawWord("ENTER START", 0.20f, -0.62f, 0.022f, 0.040f, 0.008f, lines);
-      flushLines(lines, glm::vec3(0.82f, 0.84f, 0.76f));
-      lines.clear();
-
-      drawFrame(-0.79f, 0.86f, 0.79f, 0.58f, glm::vec3(0.28f, 0.16f, 0.14f));
-      drawFrame(-0.12f, 0.80f, 0.12f, -0.80f, glm::vec3(0.24f, 0.86f, 0.16f));
       glEnable(GL_DEPTH_TEST);
     };
 
