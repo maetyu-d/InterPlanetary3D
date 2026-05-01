@@ -260,9 +260,21 @@ enum class GameMode : std::uint8_t {
   TurnBased = 1,
 };
 
+enum class AppScene : std::uint8_t {
+  Title = 0,
+  Playing = 1,
+};
+
 enum class TurnPhase : std::uint8_t {
   Build = 0,
   Attack = 1,
+};
+
+enum class TitleSelection : std::uint8_t {
+  FreePlay = 0,
+  TurnBased = 1,
+  P2Sensitivity = 2,
+  P2Invert = 3,
 };
 
 struct PlayerState {
@@ -314,11 +326,19 @@ struct MatchState {
   int winnerIndex = -1;
 };
 
+struct P2ControlSettings {
+  int sensitivityIndex = 1;
+  bool invertLook = false;
+};
+
 struct AppState {
+  AppScene scene = AppScene::Title;
+  TitleSelection titleSelection = TitleSelection::FreePlay;
   std::array<PlayerState, 2> players;
   std::array<glm::vec3, 2> spawnPositions{};
   std::array<int, 2> scores{0, 0};
   MatchState match;
+  P2ControlSettings p2Controls;
   InputState input;
   World world;
   std::array<ChunkMesh, kChunkCount> chunkMeshes;
@@ -344,6 +364,8 @@ void applyPlayerDamage(AppState& state, int playerIndex, float amount, std::opti
 void dropAtomicBomb(AppState& state, int ownerIndex);
 void updateAtomicBomb(AppState& state, float deltaTime);
 void resetMatch(AppState& state, GameMode mode);
+float p2LookSpeedFor(const AppState& state);
+void startMatch(GLFWwindow* window, AppState& state, GameMode mode);
 
 int chunkIndexForCoords(int chunkX, int chunkZ) {
   return chunkZ * kWorldChunksX + chunkX;
@@ -776,25 +798,24 @@ GLuint createWorldProgram() {
 
       float lowerHalf = smoothstep(-0.75, 0.75, uWorldCenter.y - vWorldPos.y);
       vec3 upperTint = vec3(1.00, 0.82, 0.82);
-      vec3 lowerTint = vec3(0.34, 0.68, 2.24);
-      vec3 lowerLift = vec3(lit.r * 0.24, lit.g * 0.64, lit.b * 1.72);
-      lit = mix(lit * upperTint, lowerLift * lowerTint, lowerHalf);
-      lit += vec3(0.01, 0.04, 0.12) * lowerHalf;
+      vec3 lowerTint = vec3(0.76, 1.02, 1.82);
+      vec3 lowerLit = lit * vec3(0.88, 1.02, 1.44) + vec3(0.02, 0.05, 0.15);
+      lit = mix(lit * upperTint, lowerLit * lowerTint, lowerHalf);
 
       float crease = clamp(1.0 - vAo, 0.0, 1.0);
-      float blueRim = rim * (0.55 + shadowBand * 1.35) * lowerHalf;
-      lit += vec3(0.10, 0.24, 0.58) * blueRim;
-      lit = mix(lit, lit * 0.52, crease * 0.42 * lowerHalf);
-      lit = mix(lit, lit * 1.28, shadowBand * 0.34 * lowerHalf);
+      float blueRim = rim * (0.80 + shadowBand * 1.85) * lowerHalf;
+      lit += vec3(0.16, 0.34, 0.78) * blueRim;
+      lit = mix(lit, lit * 0.72, crease * 0.20 * lowerHalf);
+      lit = mix(lit, lit * 1.36, shadowBand * 0.26 * lowerHalf);
       vec3 warmMetalLit = tex * (lowLight * 1.55 + 0.32 + verticalHeat * 0.55);
       lit = mix(lit, warmMetalLit, warmMetalMask * lowerHalf);
       vec3 coolResourceLit = tex * (lowLight * 1.42 + 0.28 + verticalHeat * 0.40);
       lit = mix(lit, coolResourceLit, coolResourceMask * lowerHalf);
 
       float dist = distance(uCameraPos, vWorldPos);
-      float groundFog = smoothstep(13.0, -6.0, vWorldPos.y) * mix(0.12, 0.06, lowerHalf);
+      float groundFog = smoothstep(13.0, -6.0, vWorldPos.y) * mix(0.12, 0.04, lowerHalf);
       float fogFactor = clamp(1.0 - exp(-(dist * uFogDensity + groundFog)), 0.0, 1.0);
-      vec3 lowerFogColor = vec3(0.06, 0.14, 0.44);
+      vec3 lowerFogColor = vec3(0.04, 0.10, 0.28);
       vec3 fogColor = mix(uFogColor, lowerFogColor, lowerHalf);
       vec3 color = mix(lit, fogColor, fogFactor);
       color = mix(color * 0.66, color * 1.24, shadowBand);
@@ -1992,11 +2013,63 @@ void updateMovement(GLFWwindow* window, AppState& state, float deltaTime) {
   static bool freePlayPressedLastFrame = false;
   static bool turnBasedPressedLastFrame = false;
   static bool resetPressedLastFrame = false;
+  static bool titleUpPressedLastFrame = false;
+  static bool titleDownPressedLastFrame = false;
+  static bool titleLeftPressedLastFrame = false;
+  static bool titleRightPressedLastFrame = false;
+  static bool titleAcceptPressedLastFrame = false;
+
+  if (state.scene == AppScene::Title) {
+    const bool upPressed = glfwGetKey(window, GLFW_KEY_UP) == GLFW_PRESS || glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS;
+    const bool downPressed = glfwGetKey(window, GLFW_KEY_DOWN) == GLFW_PRESS || glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS;
+    const bool leftPressed = glfwGetKey(window, GLFW_KEY_LEFT) == GLFW_PRESS || glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS;
+    const bool rightPressed = glfwGetKey(window, GLFW_KEY_RIGHT) == GLFW_PRESS || glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS;
+    const bool acceptPressed = glfwGetKey(window, GLFW_KEY_ENTER) == GLFW_PRESS || glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS;
+
+    if (upPressed && !titleUpPressedLastFrame) {
+      int selection = static_cast<int>(state.titleSelection);
+      selection = (selection + 3) % 4;
+      state.titleSelection = static_cast<TitleSelection>(selection);
+    }
+    if (downPressed && !titleDownPressedLastFrame) {
+      int selection = static_cast<int>(state.titleSelection);
+      selection = (selection + 1) % 4;
+      state.titleSelection = static_cast<TitleSelection>(selection);
+    }
+
+    if ((leftPressed && !titleLeftPressedLastFrame) || (rightPressed && !titleRightPressedLastFrame)) {
+      const int direction = (rightPressed && !titleRightPressedLastFrame) ? 1 : -1;
+      if (state.titleSelection == TitleSelection::P2Sensitivity) {
+        state.p2Controls.sensitivityIndex = std::clamp(state.p2Controls.sensitivityIndex + direction, 0, 2);
+      } else if (state.titleSelection == TitleSelection::P2Invert) {
+        state.p2Controls.invertLook = !state.p2Controls.invertLook;
+      }
+    }
+
+    if (acceptPressed && !titleAcceptPressedLastFrame) {
+      if (state.titleSelection == TitleSelection::FreePlay) {
+        startMatch(window, state, GameMode::FreePlay);
+      } else if (state.titleSelection == TitleSelection::TurnBased) {
+        startMatch(window, state, GameMode::TurnBased);
+      } else if (state.titleSelection == TitleSelection::P2Sensitivity) {
+        state.p2Controls.sensitivityIndex = (state.p2Controls.sensitivityIndex + 1) % 3;
+      } else if (state.titleSelection == TitleSelection::P2Invert) {
+        state.p2Controls.invertLook = !state.p2Controls.invertLook;
+      }
+    }
+
+    titleUpPressedLastFrame = upPressed;
+    titleDownPressedLastFrame = downPressed;
+    titleLeftPressedLastFrame = leftPressed;
+    titleRightPressedLastFrame = rightPressed;
+    titleAcceptPressedLastFrame = acceptPressed;
+    return;
+  }
 
   if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS && state.input.captureMouse) {
     toggleMouseCapture(window, state.input, false);
   }
-  if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS && !state.input.captureMouse) {
+  if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS && !state.input.captureMouse && state.scene == AppScene::Playing) {
     toggleMouseCapture(window, state.input, true);
   }
 
@@ -2057,8 +2130,10 @@ void updateMovement(GLFWwindow* window, AppState& state, float deltaTime) {
     const float lookX = applyDeadzone(gamepadState.axes[GLFW_GAMEPAD_AXIS_RIGHT_X]);
     const float lookY = applyDeadzone(-gamepadState.axes[GLFW_GAMEPAD_AXIS_RIGHT_Y]);
 
-    playerTwo.avatar.yaw += lookX * kGamepadLookSpeed * deltaTime;
-    playerTwo.avatar.pitch = std::clamp(playerTwo.avatar.pitch + lookY * kGamepadLookSpeed * deltaTime,
+    const float p2LookSpeed = p2LookSpeedFor(state);
+    const float lookYSign = state.p2Controls.invertLook ? -1.0f : 1.0f;
+    playerTwo.avatar.yaw += lookX * p2LookSpeed * deltaTime;
+    playerTwo.avatar.pitch = std::clamp(playerTwo.avatar.pitch + lookY * p2LookSpeed * lookYSign * deltaTime,
                                         -89.0f, 89.0f);
 
     const glm::vec3 front = cameraFront(playerTwo.avatar);
@@ -2426,6 +2501,18 @@ void resetPlacement(PlayerState& playerState) {
   playerState.placing.type = Air;
 }
 
+float p2LookSpeedFor(const AppState& state) {
+  switch (state.p2Controls.sensitivityIndex) {
+    case 0: return 95.0f;
+    case 2: return 210.0f;
+    default: return kGamepadLookSpeed;
+  }
+}
+
+bool titleSelectionEquals(const AppState& state, TitleSelection selection) {
+  return state.titleSelection == selection;
+}
+
 bool isTurnBasedBuildPhase(const AppState& state) {
   return state.match.mode == GameMode::TurnBased && !state.match.suddenDeath &&
          state.match.phase == TurnPhase::Build && !state.match.matchOver;
@@ -2559,6 +2646,12 @@ void resetMatch(AppState& state, GameMode mode) {
   state.players[1].avatar.pitch = -12.0f;
 }
 
+void startMatch(GLFWwindow* window, AppState& state, GameMode mode) {
+  resetMatch(state, mode);
+  state.scene = AppScene::Playing;
+  toggleMouseCapture(window, state.input, true);
+}
+
 }  // namespace
 
 int main() {
@@ -2610,10 +2703,11 @@ int main() {
   state.players[1].avatar.position = state.spawnPositions[1];
   initializeSatelliteState(state);
   resetMatch(state, GameMode::FreePlay);
+  state.scene = AppScene::Title;
   markAllChunksDirty(state);
   gState = &state;
   glfwSetCursorPosCallback(window, mouseCallback);
-  toggleMouseCapture(window, state.input, true);
+  toggleMouseCapture(window, state.input, false);
 
   glEnable(GL_DEPTH_TEST);
   glEnable(GL_CULL_FACE);
@@ -2657,17 +2751,19 @@ int main() {
     lastFrame = currentFrame;
 
     updateMovement(window, state, deltaTime);
-    updateHoveredBlock(state, 0);
-    updateHoveredBlock(state, 1);
-    handleBlockInput(window, state, deltaTime);
-    handleAtomicBombInput(window, state);
-    updateHand(state.players[0], deltaTime);
-    updateHand(state.players[1], deltaTime);
-    updateCameraFeedback(state.players[0], deltaTime);
-    updateCameraFeedback(state.players[1], deltaTime);
-    updateAtomicBomb(state, deltaTime);
-    updateSatelliteFuel(state, deltaTime);
-    updateMatchState(state, deltaTime);
+    if (state.scene == AppScene::Playing) {
+      updateHoveredBlock(state, 0);
+      updateHoveredBlock(state, 1);
+      handleBlockInput(window, state, deltaTime);
+      handleAtomicBombInput(window, state);
+      updateHand(state.players[0], deltaTime);
+      updateHand(state.players[1], deltaTime);
+      updateCameraFeedback(state.players[0], deltaTime);
+      updateCameraFeedback(state.players[1], deltaTime);
+      updateAtomicBomb(state, deltaTime);
+      updateSatelliteFuel(state, deltaTime);
+      updateMatchState(state, deltaTime);
+    }
     rebuildDirtyChunks(state);
 
     int width = 0;
@@ -2706,6 +2802,270 @@ int main() {
         glBindVertexArray(chunk.mesh.vao);
         glDrawArrays(GL_TRIANGLES, 0, chunk.mesh.vertexCount);
       }
+    };
+
+    const auto drawTitleScreen = [&](int viewportWidth, int viewportHeight) {
+      glDisable(GL_SCISSOR_TEST);
+      glViewport(0, 0, viewportWidth, viewportHeight);
+      glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+      glDisable(GL_DEPTH_TEST);
+      glUseProgram(colorProgram);
+      glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uView"), 1, GL_FALSE, glm::value_ptr(identity));
+      glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uProjection"), 1, GL_FALSE, glm::value_ptr(identity));
+      glUniform1f(glGetUniformLocation(colorProgram, "uAlpha"), 1.0f);
+      glBindVertexArray(solidCubeVao);
+
+      const auto drawPanel = [&](float x, float y, float w, float h, const glm::vec3& color) {
+        const glm::mat4 model =
+            glm::translate(glm::mat4(1.0f), glm::vec3(x, y, 0.0f)) *
+            glm::scale(glm::mat4(1.0f), glm::vec3(w, h, 0.01f));
+        glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(model));
+        glUniform3f(glGetUniformLocation(colorProgram, "uColor"), color.x, color.y, color.z);
+        glDrawArrays(GL_TRIANGLES, 0, 36);
+      };
+
+      drawPanel(-1.0f, -1.0f, 1.0f, 2.0f, glm::vec3(0.18f, 0.03f, 0.02f));
+      drawPanel(0.0f, -1.0f, 1.0f, 2.0f, glm::vec3(0.02f, 0.06f, 0.18f));
+      drawPanel(-0.015f, -1.0f, 0.03f, 2.0f, glm::vec3(0.16f, 0.74f, 0.10f));
+      drawPanel(-0.78f, 0.60f, 1.56f, 0.26f, glm::vec3(0.06f, 0.01f, 0.01f));
+      drawPanel(-0.64f, 0.66f, 1.28f, 0.11f, glm::vec3(0.10f, 0.02f, 0.02f));
+
+      const auto drawFrame = [&](float left, float top, float right, float bottom, const glm::vec3& color) {
+        const std::array<glm::vec3, 5> frame = {
+            glm::vec3(left, top, 0.0f), glm::vec3(right, top, 0.0f), glm::vec3(right, bottom, 0.0f),
+            glm::vec3(left, bottom, 0.0f), glm::vec3(left, top, 0.0f)};
+        glBindVertexArray(orbitLineVao);
+        glBindBuffer(GL_ARRAY_BUFFER, orbitLineVbo);
+        glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(frame), frame.data());
+        glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(identity));
+        glUniform3f(glGetUniformLocation(colorProgram, "uColor"), color.x, color.y, color.z);
+        glDrawArrays(GL_LINE_STRIP, 0, static_cast<GLsizei>(frame.size()));
+      };
+
+      const auto drawDigitLines = [&](int digit, float x, float y, float w, float h,
+                                      std::vector<glm::vec3>& lines) {
+        const glm::vec2 topL(x, y), topR(x + w, y), midL(x, y - h * 0.5f), midR(x + w, y - h * 0.5f),
+            botL(x, y - h), botR(x + w, y - h);
+        const bool seg[10][7] = {
+            {true, true, true, false, true, true, true}, {false, false, true, false, false, true, false},
+            {true, false, true, true, true, false, true}, {true, false, true, true, false, true, true},
+            {false, true, true, true, false, true, false}, {true, true, false, true, false, true, true},
+            {true, true, false, true, true, true, true}, {true, false, true, false, false, true, false},
+            {true, true, true, true, true, true, true}, {true, true, true, true, false, true, true},
+        };
+        const auto add = [&](glm::vec2 a, glm::vec2 b) {
+          lines.push_back(glm::vec3(a, 0.0f));
+          lines.push_back(glm::vec3(b, 0.0f));
+        };
+        if (seg[digit][0]) add(topL, topR);
+        if (seg[digit][1]) add(topL, midL);
+        if (seg[digit][2]) add(topR, midR);
+        if (seg[digit][3]) add(midL, midR);
+        if (seg[digit][4]) add(midL, botL);
+        if (seg[digit][5]) add(midR, botR);
+        if (seg[digit][6]) add(botL, botR);
+      };
+
+      const auto drawGlyphLines = [&](char glyph, float x, float y, float w, float h,
+                                      std::vector<glm::vec3>& lines) {
+        const glm::vec2 tl(x, y);
+        const glm::vec2 tc(x + w * 0.5f, y);
+        const glm::vec2 tr(x + w, y);
+        const glm::vec2 ml(x, y - h * 0.5f);
+        const glm::vec2 mc(x + w * 0.5f, y - h * 0.5f);
+        const glm::vec2 mr(x + w, y - h * 0.5f);
+        const glm::vec2 bl(x, y - h);
+        const glm::vec2 bc(x + w * 0.5f, y - h);
+        const glm::vec2 br(x + w, y - h);
+        const auto add = [&](glm::vec2 a, glm::vec2 b) {
+          lines.push_back(glm::vec3(a, 0.0f));
+          lines.push_back(glm::vec3(b, 0.0f));
+        };
+
+        switch (glyph) {
+          case 'A':
+            add(bl, tl); add(tl, tr); add(tr, br); add(ml, mr); break;
+          case 'D':
+            add(bl, tl); add(tl, tr); add(tr, br); add(br, bl); break;
+          case 'E':
+            add(bl, tl); add(tl, tr); add(ml, mr); add(bl, br); break;
+          case 'F':
+            add(bl, tl); add(tl, tr); add(ml, mr); break;
+          case 'I':
+            add(tl, tr); add(tc, bc); add(bl, br); break;
+          case 'L':
+            add(tl, bl); add(bl, br); break;
+          case 'M':
+            add(bl, tl); add(tl, mc); add(mc, tr); add(tr, br); break;
+          case 'N':
+            add(bl, tl); add(tl, br); add(br, tr); break;
+          case 'O':
+            add(bl, tl); add(tl, tr); add(tr, br); add(br, bl); break;
+          case 'P':
+            add(bl, tl); add(tl, tr); add(tr, mr); add(mr, ml); break;
+          case 'R':
+            add(bl, tl); add(tl, tr); add(tr, mr); add(mr, ml); add(ml, br); break;
+          case 'S':
+            add(tr, tl); add(tl, ml); add(ml, mr); add(mr, br); add(br, bl); break;
+          case 'T':
+            add(tl, tr); add(tc, bc); break;
+          case 'U':
+            add(tl, bl); add(bl, br); add(br, tr); break;
+          case 'V':
+            add(tl, bc); add(bc, tr); break;
+          case 'W':
+            add(tl, bl); add(bl, mc); add(mc, br); add(br, tr); break;
+          case 'Y':
+            add(tl, mc); add(tr, mc); add(mc, bc); break;
+          case '/':
+            add(bl, tr); break;
+          case '-':
+            add(ml, mr); break;
+          default:
+            break;
+        }
+      };
+
+      const auto drawWord = [&](const std::string& text, float x, float y, float w, float h, float spacing,
+                                std::vector<glm::vec3>& lines) {
+        float cursor = x;
+        for (char ch : text) {
+          if (ch == ' ') {
+            cursor += w * 0.9f;
+            continue;
+          }
+          if (ch >= '0' && ch <= '9') {
+            drawDigitLines(ch - '0', cursor, y, w, h, lines);
+          } else {
+            drawGlyphLines(static_cast<char>(std::toupper(static_cast<unsigned char>(ch))), cursor, y, w, h, lines);
+          }
+          cursor += w + spacing;
+        }
+      };
+
+      const auto flushLines = [&](const std::vector<glm::vec3>& lines, const glm::vec3& color) {
+        if (lines.empty()) {
+          return;
+        }
+        glBindVertexArray(orbitLineVao);
+        glBindBuffer(GL_ARRAY_BUFFER, orbitLineVbo);
+        glBufferSubData(GL_ARRAY_BUFFER, 0,
+                        static_cast<GLsizeiptr>(lines.size() * sizeof(glm::vec3)),
+                        lines.data());
+        glUniformMatrix4fv(glGetUniformLocation(colorProgram, "uModel"), 1, GL_FALSE, glm::value_ptr(identity));
+        glUniform3f(glGetUniformLocation(colorProgram, "uColor"), color.x, color.y, color.z);
+        glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(lines.size()));
+      };
+
+      const auto drawSelectedCard = [&](float x, float y, float w, float h, bool selected, const glm::vec3& baseColor) {
+        const glm::vec3 fill = selected ? baseColor : baseColor * 0.55f;
+        drawPanel(x, y, w, h, fill);
+        drawFrame(x, y + h, x + w, y, selected ? glm::vec3(1.0f, 0.92f, 0.64f) : glm::vec3(0.46f, 0.22f, 0.18f));
+      };
+
+      drawSelectedCard(-0.84f, 0.12f, 0.72f, 0.30f,
+                       titleSelectionEquals(state, TitleSelection::FreePlay),
+                       glm::vec3(0.22f, 0.05f, 0.03f));
+      drawSelectedCard(0.12f, 0.12f, 0.72f, 0.30f,
+                       titleSelectionEquals(state, TitleSelection::TurnBased),
+                       glm::vec3(0.06f, 0.04f, 0.11f));
+      drawSelectedCard(-0.84f, -0.38f, 0.72f, 0.22f,
+                       titleSelectionEquals(state, TitleSelection::P2Sensitivity),
+                       glm::vec3(0.04f, 0.05f, 0.08f));
+      drawSelectedCard(0.12f, -0.38f, 0.72f, 0.22f,
+                       titleSelectionEquals(state, TitleSelection::P2Invert),
+                       glm::vec3(0.04f, 0.05f, 0.08f));
+
+      std::vector<glm::vec3> lines;
+      lines.reserve(2048);
+
+      drawWord("INTERPLANETARY3D", -0.60f, 0.81f, 0.052f, 0.11f, 0.015f, lines);
+      flushLines(lines, glm::vec3(1.0f, 0.95f, 0.80f));
+      lines.clear();
+
+      drawWord("BY MATD SPACE", -0.23f, 0.70f, 0.022f, 0.045f, 0.008f, lines);
+      flushLines(lines, glm::vec3(0.74f, 0.84f, 0.92f));
+      lines.clear();
+
+      drawWord("FREE PLAY", -0.77f, 0.42f, 0.040f, 0.07f, 0.012f, lines);
+      flushLines(lines, glm::vec3(0.98f, 0.86f, 0.38f));
+      lines.clear();
+
+      drawWord("TURN MODE", 0.18f, 0.42f, 0.040f, 0.07f, 0.012f, lines);
+      flushLines(lines, glm::vec3(0.80f, 0.90f, 1.0f));
+      lines.clear();
+
+      drawWord("P2 LOOK SPEED", -0.77f, -0.17f, 0.030f, 0.055f, 0.010f, lines);
+      flushLines(lines, glm::vec3(0.78f, 0.88f, 0.98f));
+      lines.clear();
+
+      drawWord("P2 Y INVERT", 0.18f, -0.17f, 0.030f, 0.055f, 0.010f, lines);
+      flushLines(lines, glm::vec3(0.78f, 0.88f, 0.98f));
+      lines.clear();
+
+      drawDigitLines(3, -0.74f, 0.36f, 0.10f, 0.16f, lines);
+      flushLines(lines, glm::vec3(1.0f, 0.84f, 0.34f));
+      lines.clear();
+      const std::array<glm::vec3, 8> freeCrosshair = {
+          glm::vec3(-0.46f, 0.27f, 0.0f), glm::vec3(-0.30f, 0.27f, 0.0f),
+          glm::vec3(-0.38f, 0.19f, 0.0f), glm::vec3(-0.38f, 0.35f, 0.0f),
+          glm::vec3(-0.49f, 0.27f, 0.0f), glm::vec3(-0.43f, 0.27f, 0.0f),
+          glm::vec3(-0.33f, 0.27f, 0.0f), glm::vec3(-0.27f, 0.27f, 0.0f),
+      };
+      glBindVertexArray(orbitLineVao);
+      glBindBuffer(GL_ARRAY_BUFFER, orbitLineVbo);
+      glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(freeCrosshair), freeCrosshair.data());
+      glUniform3f(glGetUniformLocation(colorProgram, "uColor"), 1.0f, 0.72f, 0.28f);
+      glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(freeCrosshair.size()));
+
+      drawDigitLines(1, 0.22f, 0.36f, 0.08f, 0.14f, lines);
+      drawDigitLines(0, 0.33f, 0.36f, 0.08f, 0.14f, lines);
+      lines.push_back(glm::vec3(0.44f, 0.22f, 0.0f));
+      lines.push_back(glm::vec3(0.49f, 0.36f, 0.0f));
+      drawDigitLines(6, 0.54f, 0.36f, 0.08f, 0.14f, lines);
+      drawDigitLines(0, 0.65f, 0.36f, 0.08f, 0.14f, lines);
+      flushLines(lines, glm::vec3(0.82f, 0.92f, 1.0f));
+      lines.clear();
+
+      for (int i = 0; i < 5; ++i) {
+        drawPanel(0.22f + i * 0.10f, 0.17f + ((i % 2) ? 0.03f : 0.0f), 0.06f, 0.05f,
+                  i % 2 == 0 ? glm::vec3(0.54f, 0.18f, 0.08f) : glm::vec3(0.20f, 0.46f, 0.90f));
+      }
+
+      for (int i = 0; i < 3; ++i) {
+        const bool lit = i <= state.p2Controls.sensitivityIndex;
+        drawPanel(-0.76f + i * 0.14f, -0.31f, 0.08f, 0.11f + i * 0.03f,
+                  lit ? glm::vec3(0.66f, 0.86f, 1.0f) : glm::vec3(0.12f, 0.16f, 0.22f));
+      }
+      drawWord("SLOW", -0.78f, -0.34f, 0.020f, 0.040f, 0.008f, lines);
+      drawWord("MID", -0.63f, -0.34f, 0.020f, 0.040f, 0.008f, lines);
+      drawWord("FAST", -0.48f, -0.34f, 0.020f, 0.040f, 0.008f, lines);
+      flushLines(lines, glm::vec3(0.72f, 0.82f, 0.94f));
+      lines.clear();
+
+      const glm::vec3 invertColor = state.p2Controls.invertLook ? glm::vec3(0.66f, 0.96f, 0.74f)
+                                                                : glm::vec3(0.34f, 0.42f, 0.50f);
+      const std::array<glm::vec3, 8> invertIcon = {
+          glm::vec3(0.24f, -0.22f, 0.0f), glm::vec3(0.42f, -0.22f, 0.0f),
+          glm::vec3(0.42f, -0.22f, 0.0f), glm::vec3(0.36f, -0.16f, 0.0f),
+          glm::vec3(0.42f, -0.22f, 0.0f), glm::vec3(0.36f, -0.28f, 0.0f),
+          glm::vec3(0.54f, -0.16f, 0.0f), glm::vec3(0.54f, -0.32f, 0.0f),
+      };
+      glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(invertIcon), invertIcon.data());
+      glUniform3f(glGetUniformLocation(colorProgram, "uColor"), invertColor.x, invertColor.y, invertColor.z);
+      glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(invertIcon.size()));
+      drawWord(state.p2Controls.invertLook ? "ON" : "OFF", 0.60f, -0.23f, 0.030f, 0.060f, 0.010f, lines);
+      flushLines(lines, invertColor);
+      lines.clear();
+
+      drawWord("ARROWS CHANGE", -0.42f, -0.62f, 0.022f, 0.040f, 0.008f, lines);
+      drawWord("ENTER START", 0.20f, -0.62f, 0.022f, 0.040f, 0.008f, lines);
+      flushLines(lines, glm::vec3(0.82f, 0.84f, 0.76f));
+      lines.clear();
+
+      drawFrame(-0.79f, 0.86f, 0.79f, 0.58f, glm::vec3(0.28f, 0.16f, 0.14f));
+      drawFrame(-0.12f, 0.80f, 0.12f, -0.80f, glm::vec3(0.24f, 0.86f, 0.16f));
+      glEnable(GL_DEPTH_TEST);
     };
 
     const auto drawForcefield = [&](const glm::mat4& drawView,
@@ -3056,9 +3416,9 @@ int main() {
       glUseProgram(skyProgram);
       glUniform1f(glGetUniformLocation(skyProgram, "uTime"), currentFrame);
       if (playerState.invertedGravity) {
-        glUniform3f(glGetUniformLocation(skyProgram, "uTopTint"), 0.00f, 0.02f, 0.08f);
-        glUniform3f(glGetUniformLocation(skyProgram, "uHorizonTint"), 0.10f, 0.24f, 0.56f);
-        glUniform3f(glGetUniformLocation(skyProgram, "uPitTint"), 0.00f, 0.00f, 0.02f);
+        glUniform3f(glGetUniformLocation(skyProgram, "uTopTint"), 0.00f, 0.01f, 0.05f);
+        glUniform3f(glGetUniformLocation(skyProgram, "uHorizonTint"), 0.05f, 0.18f, 0.40f);
+        glUniform3f(glGetUniformLocation(skyProgram, "uPitTint"), 0.00f, 0.00f, 0.015f);
       } else {
         glUniform3f(glGetUniformLocation(skyProgram, "uTopTint"), 0.18f, 0.03f, 0.02f);
         glUniform3f(glGetUniformLocation(skyProgram, "uHorizonTint"), 0.58f, 0.16f, 0.08f);
@@ -3084,11 +3444,11 @@ int main() {
           glm::lookAt(eye, eye + cameraFront(playerState.avatar), viewUpVector(playerState));
 
       const glm::vec3 fogColor =
-          playerState.invertedGravity ? glm::vec3(0.02f, 0.06f, 0.18f) : glm::vec3(0.23f, 0.05f, 0.04f);
-      const float exposure = playerState.invertedGravity ? 2.15f : 1.0f;
-      const float fogDensity = playerState.invertedGravity ? 0.0046f : 0.013f;
+          playerState.invertedGravity ? glm::vec3(0.04f, 0.10f, 0.24f) : glm::vec3(0.23f, 0.05f, 0.04f);
+      const float exposure = playerState.invertedGravity ? 1.85f : 1.0f;
+      const float fogDensity = playerState.invertedGravity ? 0.0034f : 0.013f;
 
-      const float contrastBoost = playerState.invertedGravity ? 1.08f : 1.0f;
+      const float contrastBoost = playerState.invertedGravity ? 1.02f : 1.0f;
       drawWorld(view, projection, eye, fogColor, exposure, fogDensity, contrastBoost);
       drawForcefield(view, projection, 1.0f, false);
       drawAtomicBomb(view, projection);
@@ -3761,6 +4121,13 @@ int main() {
       glEnable(GL_DEPTH_TEST);
       glDisable(GL_SCISSOR_TEST);
     };
+
+    if (state.scene == AppScene::Title) {
+      drawTitleScreen(width, height);
+      glfwSwapBuffers(window);
+      glfwPollEvents();
+      continue;
+    }
 
     const int halfWidth = width / 2;
     renderPlayerViewport(0, 0, 0, halfWidth, height);
